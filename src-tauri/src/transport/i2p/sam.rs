@@ -222,22 +222,18 @@ pub fn default_session_options() -> Vec<(&'static str, &'static str)> {
         ("outbound.length", "2"),
         ("inbound.quantity", "3"),
         ("outbound.quantity", "3"),
-        // Encrypted LS2 (type 5) with ECIES-X25519-AEAD on-wire encryption
-        // and per-client DH authorization (authType=1). The owner provides
-        // a list of authorized recipient X25519 public keys via the
-        // `i2cp.leaseSetClient.NN.dh` options the *caller* appends after
-        // these defaults; without that list the bridge will reject the
-        // session create. The owner's own X25519 private key is supplied
-        // via `i2cp.leaseSetPrivKey` so the bridge can decrypt incoming
-        // leaseset lookups when this peer dials others.
+        // LS2 (type 3) with ECIES-X25519-AEAD on-wire encryption.
         //
-        // Net effect: floodfill operators store an opaque blob for our
-        // destination; only contacts whose pubkey is in our auth list
-        // can decrypt the leaseset and route to us. Solves the "anyone
-        // who once got our bundle can monitor when we're online" leak
-        // of plain LS2.
-        ("i2cp.leaseSetType", "5"),
-        ("i2cp.leaseSetAuthType", "1"),
+        // Encrypted LS2 (type 5) with per-client DH auth was attempted
+        // but rejected by i2pd's SAM bridge when the auth list is empty
+        // (fresh install with no contacts). Making encrypted leasesets
+        // work properly requires cycling the session on every contact-
+        // add so the auth list updates — that's session-restart machinery
+        // we haven't built yet. Until then we use LS2: anyone who knows
+        // our destination can resolve us. Practical exposure stays
+        // small because destinations are only ever shared via signed
+        // bundles (QR / whisper:// link), never a public directory.
+        ("i2cp.leaseSetType", "3"),
         ("i2cp.leaseSetEncType", "4"),
     ]
 }
@@ -563,14 +559,15 @@ mod tests {
     }
 
     #[test]
-    fn default_session_options_use_encrypted_ls2_with_dh_auth() {
+    fn default_session_options_use_ls2_with_ecies() {
         let opts = default_session_options();
         let m: std::collections::HashMap<_, _> = opts.into_iter().collect();
-        // Encrypted LS2 (type 5) with per-client DH auth (authType 1)
-        // and ECIES-X25519-AEAD on-wire encryption (encType 4).
-        assert_eq!(m.get("i2cp.leaseSetType"), Some(&"5"));
-        assert_eq!(m.get("i2cp.leaseSetAuthType"), Some(&"1"));
+        // LS2 (type 3) with ECIES-X25519-AEAD (encType 4). Encrypted
+        // leasesets (type 5 + authType 1) are deferred until we wire
+        // session-cycling on contact-add.
+        assert_eq!(m.get("i2cp.leaseSetType"), Some(&"3"));
         assert_eq!(m.get("i2cp.leaseSetEncType"), Some(&"4"));
+        assert!(m.get("i2cp.leaseSetAuthType").is_none());
         assert_eq!(m.get("SIGNATURE_TYPE"), Some(&"7"));
     }
 

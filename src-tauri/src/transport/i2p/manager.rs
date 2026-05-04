@@ -291,30 +291,13 @@ impl I2PManager {
             destination.priv_b64.len()
         );
 
-        // Build the encrypted-leaseset DH-auth list from the secondary
-        // DB: our own X25519 private key (used by i2pd to decrypt
-        // incoming leaseset lookups when WE dial peers) plus the X25519
-        // public key of every known contact (so each contact can
-        // resolve OUR leaseset and dial us). New contacts added during
-        // this session can't reach us until next vault unlock — auto-
-        // cycling sessions on contact change is a follow-up.
-        let (our_x_priv, contact_pubs) = {
-            let guard = db.lock();
-            (
-                read_identity_x25519_priv(&guard).unwrap_or([0u8; 32]),
-                read_contact_x25519_pubs(&guard),
-            )
-        };
-        let auth_opts = sam::encrypted_leaseset_options(&our_x_priv, &contact_pubs);
-        let auth_opt_refs: Vec<(&str, &str)> = auth_opts
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        tracing::info!(
-            "i2p: encrypted leaseset auth list: {} contact(s)",
-            contact_pubs.len()
-        );
-
+        // Encrypted-leaseset DH-auth list construction is deferred:
+        // i2pd rejects SESSION CREATE with an empty auth list, and we
+        // don't yet cycle the session on contact-add. Plain LS2 keeps
+        // the bootstrap working for both fresh installs and existing
+        // users; the practical exposure is small because destinations
+        // are only ever shared via signed bundles, not a public
+        // directory.
         let session_id = format!("whisper-{}", uuid::Uuid::new_v4().simple());
         let mut control = sam::connect(&sam_addr).await?;
         let _v = sam::hello(&mut control).await?;
@@ -322,7 +305,7 @@ impl I2PManager {
             &mut control,
             &session_id,
             &destination.priv_b64,
-            &auth_opt_refs,
+            &[],
         )
         .await?;
         tracing::info!("i2p: master STREAM session `{session_id}` created");
