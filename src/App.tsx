@@ -5,6 +5,7 @@ import { TitleBar } from "./components/layout/TitleBar";
 import { Sidebar } from "./components/layout/Sidebar";
 import { ChatView } from "./components/layout/ChatView";
 import { InfoPanel } from "./components/layout/InfoPanel";
+import { I2pBootstrapBanner } from "./components/layout/I2pBootstrapBanner";
 import { VaultLock } from "./components/vault/VaultLock";
 import { VaultSetup } from "./components/vault/VaultSetup";
 import { OnboardingFlow } from "./components/vault/OnboardingFlow";
@@ -112,6 +113,7 @@ export default function App() {
             : undefined
         }
       />
+      {phase === "ready" && <I2pBootstrapBanner />}
       <div className="flex-1 min-h-0 flex">
         {phase === "loading" && <LoadingShell />}
 
