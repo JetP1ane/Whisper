@@ -1487,10 +1487,7 @@ pub async fn message_send(
     let contact_clone = contact.clone();
     let prepared_for_task = PreparedDispatch {
         msg_id: prepared.msg_id.clone(),
-        mailbox_hex: prepared.mailbox_hex.clone(),
         blob: prepared.blob.clone(),
-        target_relay_url: prepared.target_relay_url.clone(),
-        relay_ttl: 60 * 60 * 24,
         frame_kind: crate::transport::i2p::framing::FrameType::Message,
     };
     tokio::spawn(async move {
@@ -1500,39 +1497,27 @@ pub async fn message_send(
     Ok(prepared.message.id)
 }
 
-/// Inputs the background dispatch task needs to attempt delivery via
-/// I2P first then relay. All fields are owned so the task doesn't
-/// borrow command state.
+/// Inputs the background dispatch task needs to attempt I2P delivery.
+/// All fields are owned so the task doesn't borrow command state.
 struct PreparedDispatch {
     msg_id: String,
-    mailbox_hex: String,
     blob: Vec<u8>,
-    target_relay_url: Option<String>,
-    /// Relay deposit TTL in seconds. For regular text this is 24h; for
-    /// detonating messages it's clamped to the detonation window.
-    relay_ttl: u64,
     /// Which I2P frame type to use. Text/control envelopes are
     /// `Message`; attachments use `FileMetadata`.
     frame_kind: crate::transport::i2p::framing::FrameType,
 }
 
-/// Background dispatch: try I2P first, fall back to relay (unless
-/// I2P-only mode is on, in which case mark the row failed and stop).
-/// Always returns; failures are logged + surface via `message:status`.
+/// Background dispatch: I2P-only. The relay code path was removed; if
+/// I2P can't reach the peer (after the internal retry ladder), the
+/// message is marked failed and the user sees the explicit signal.
+/// Always returns; failures surface via `message:status`.
 async fn dispatch_outbound(
     state: std::sync::Arc<AppState>,
     app: tauri::AppHandle,
     contact: Contact,
     prepared: PreparedDispatch,
 ) {
-    let attempted_i2p = match try_i2p_deliver(
-        &state,
-        &contact,
-        prepared.frame_kind,
-        &prepared.blob,
-    )
-    .await
-    {
+    match try_i2p_deliver(&state, &contact, prepared.frame_kind, &prepared.blob).await {
         Ok(true) => {
             {
                 let guard = state.vault.lock();
@@ -1544,80 +1529,19 @@ async fn dispatch_outbound(
                 }
             }
             emit_message_status_sent(&app, &prepared.msg_id);
-            return;
         }
-        Ok(false) => true,
-        Err(e) => {
-            tracing::warn!("dispatch_outbound: try_i2p_deliver errored: {e}");
-            true
-        }
-    };
-
-    // I2P-only: no relay fallback. Mark failed.
-    if is_i2p_only(&state) {
-        let guard = state.vault.lock();
-        if let Some(rt) = guard.as_ref() {
-            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
-        }
-        emit_message_status(&app, &prepared.msg_id, "failed");
-        return;
-    }
-    let _ = attempted_i2p;
-
-    match prepared.target_relay_url.as_deref() {
-        Some(target) => {
-            tracing::info!(
-                "dispatch_outbound: cross-relay deposit to {} for {}",
-                target,
+        _ => {
+            tracing::warn!(
+                "dispatch_outbound: I2P delivery to {} failed; marking message failed",
                 contact.alias
             );
-            let pin = lookup_relay_pin(&state, target);
-            let result = crate::transport::relay::transient_deposit(
-                target,
-                &prepared.mailbox_hex,
-                &prepared.blob,
-                prepared.relay_ttl,
-                std::time::Duration::from_secs(10),
-                pin,
-            )
-            .await;
-            record_transient_deposit(&state, target, &result);
-            match result {
-                Ok(captured) => {
-                    persist_relay_pin_if_new(&state, target, pin, captured);
-                    {
-                        let guard = state.vault.lock();
-                        if let Some(rt) = guard.as_ref() {
-                            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
-                            let _ = rt.db.set_message_delivery_transport(
-                                &prepared.msg_id,
-                                "relay",
-                            );
-                        }
-                    }
-                    emit_message_status_sent(&app, &prepared.msg_id);
-                }
-                Err(e) => {
-                    tracing::warn!("dispatch_outbound: cross-relay deposit failed: {e}");
-                    {
-                        let guard = state.vault.lock();
-                        if let Some(rt) = guard.as_ref() {
-                            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
-                        }
-                    }
-                    emit_message_status(&app, &prepared.msg_id, "failed");
+            {
+                let guard = state.vault.lock();
+                if let Some(rt) = guard.as_ref() {
+                    let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
                 }
             }
-        }
-        None => {
-            // Same-relay fast path: ride the persistent home connection.
-            stamp_transport(&state, &prepared.msg_id, "relay");
-            let _ = state.relay.deposit(
-                prepared.mailbox_hex.clone(),
-                &prepared.blob,
-                prepared.relay_ttl,
-                prepared.msg_id.clone(),
-            );
+            emit_message_status(&app, &prepared.msg_id, "failed");
         }
     }
 }
@@ -1718,12 +1642,10 @@ pub async fn message_send_detonating(
     let state_clone = std::sync::Arc::clone(&state);
     let app_clone = app.clone();
     let contact_clone = contact.clone();
+    let _ = relay_ttl; // legacy — relay path removed
     let prepared_for_task = PreparedDispatch {
         msg_id: prepared.msg_id.clone(),
-        mailbox_hex: prepared.mailbox_hex.clone(),
         blob: prepared.blob.clone(),
-        target_relay_url: prepared.target_relay_url.clone(),
-        relay_ttl,
         frame_kind: crate::transport::i2p::framing::FrameType::Message,
     };
     tokio::spawn(async move {
@@ -1899,69 +1821,38 @@ pub async fn room_create(
         wires
     };
 
-    // Async fan-out: deliver each invite either via I2P direct, the
-    // home WS, or a transient connection to the invitee's relay.
+    // Async fan-out: I2P direct delivery to each invitee. Members
+    // without an i2p_destination on file are skipped (their bundle
+    // predates v3 — they need to re-pair).
     let i2p_runtime = {
         let slot = state.i2p.lock().await;
         slot.as_ref().cloned()
     };
-    let home = state.relay.current_url();
-    for (blob, recipient_mb_hex, target, i2p_dest) in prepared {
-        let mut delivered = false;
-        if let (Some(rt), Some(dest)) = (i2p_runtime.as_ref(), i2p_dest.as_deref()) {
-            if dest.len() >= 400 {
-                if let Ok(inner) =
-                    crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob)
-                {
-                    if rt
-                        .connection
-                        .send_blob(
-                            dest,
-                            crate::transport::i2p::framing::FrameType::Message,
-                            inner,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        delivered = true;
-                    }
-                }
-            }
-        }
-        if delivered {
+    for (blob, _recipient_mb_hex, _target, i2p_dest) in prepared {
+        let Some(rt) = i2p_runtime.as_ref() else {
+            tracing::warn!("room_create: I2P runtime not ready; invite dropped");
+            continue;
+        };
+        let Some(dest) = i2p_dest.as_deref() else {
+            tracing::warn!("room_create: invitee has no i2p_destination; skipping");
+            continue;
+        };
+        if dest.len() < 400 {
             continue;
         }
-
-        let cross = match (target.as_deref(), home.as_deref()) {
-            (Some(t), Some(h)) if !t.is_empty() && t != h => Some(t.to_string()),
-            (Some(t), None) if !t.is_empty() => Some(t.to_string()),
-            _ => None,
+        let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) else {
+            continue;
         };
-        match cross {
-            Some(url) => {
-                let pin = lookup_relay_pin(&state, &url);
-                let result = crate::transport::relay::transient_deposit(
-                    &url,
-                    &recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    Duration::from_secs(10),
-                    pin,
-                )
-                .await;
-                record_transient_deposit(&state, &url, &result);
-                if let Ok(captured) = result {
-                    persist_relay_pin_if_new(&state, &url, pin, captured);
-                }
-            }
-            None => {
-                let _ = state.relay.deposit(
-                    recipient_mb_hex.clone(),
-                    &blob,
-                    60 * 60 * 24,
-                    uuid::Uuid::new_v4().to_string(),
-                );
-            }
+        if let Err(e) = rt
+            .connection
+            .send_blob(
+                dest,
+                crate::transport::i2p::framing::FrameType::Message,
+                inner,
+            )
+            .await
+        {
+            tracing::warn!("room_create: I2P delivery failed: {e}");
         }
     }
     Ok(room_id_str)
@@ -2085,70 +1976,36 @@ pub async fn room_send(
         blobs
     };
 
-    // Snapshot the I2P runtime once for the whole room fan-out.
+    // I2P-direct fan-out per recipient.
     let i2p_runtime = {
         let slot = state.i2p.lock().await;
         slot.as_ref().cloned()
     };
-
-    let home = state.relay.current_url();
-    for (blob, recipient_mb_hex, target, i2p_dest) in prepared {
-        // I2P first per recipient.
-        let mut delivered = false;
-        if let (Some(rt), Some(dest)) = (i2p_runtime.as_ref(), i2p_dest.as_deref()) {
-            if dest.len() >= 400 {
-                if let Ok(inner) =
-                    crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob)
-                {
-                    if rt
-                        .connection
-                        .send_blob(
-                            dest,
-                            crate::transport::i2p::framing::FrameType::Message,
-                            inner,
-                        )
-                        .await
-                        .is_ok()
-                    {
-                        delivered = true;
-                    }
-                }
-            }
-        }
-        if delivered {
+    for (blob, _recipient_mb_hex, _target, i2p_dest) in prepared {
+        let Some(rt) = i2p_runtime.as_ref() else {
+            tracing::warn!("room_send: I2P runtime not ready; recipient skipped");
+            continue;
+        };
+        let Some(dest) = i2p_dest.as_deref() else {
+            tracing::warn!("room_send: member has no i2p_destination; skipping");
+            continue;
+        };
+        if dest.len() < 400 {
             continue;
         }
-
-        let cross = match (target.as_deref(), home.as_deref()) {
-            (Some(t), Some(h)) if !t.is_empty() && t != h => Some(t.to_string()),
-            (Some(t), None) if !t.is_empty() => Some(t.to_string()),
-            _ => None,
+        let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) else {
+            continue;
         };
-        match cross {
-            Some(url) => {
-                let pin = lookup_relay_pin(&state, &url);
-                let result = crate::transport::relay::transient_deposit(
-                    &url,
-                    &recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    Duration::from_secs(10),
-                    pin,
-                )
-                .await;
-                record_transient_deposit(&state, &url, &result);
-                if let Ok(captured) = result {
-                    persist_relay_pin_if_new(&state, &url, pin, captured);
-                }
-            }
-            None => {
-                let _ = state.relay.deposit(
-                    recipient_mb_hex.clone(),
-                    &blob,
-                    60 * 60 * 24,
-                    uuid::Uuid::new_v4().to_string(),
-                );
-            }
+        if let Err(e) = rt
+            .connection
+            .send_blob(
+                dest,
+                crate::transport::i2p::framing::FrameType::Message,
+                inner,
+            )
+            .await
+        {
+            tracing::warn!("room_send: I2P delivery failed: {e}");
         }
     }
 
@@ -2256,10 +2113,7 @@ pub async fn message_send_attachment(
     let contact_clone = contact.clone();
     let prepared_for_task = PreparedDispatch {
         msg_id: prepared.msg_id.clone(),
-        mailbox_hex: prepared.mailbox_hex.clone(),
         blob: prepared.blob.clone(),
-        target_relay_url: prepared.target_relay_url.clone(),
-        relay_ttl: 60 * 60 * 24,
         frame_kind: crate::transport::i2p::framing::FrameType::FileMetadata,
     };
     tokio::spawn(async move {
@@ -2402,53 +2256,6 @@ pub async fn i2p_get_transit_optin(
         .map_err(err)?
         .map(|v| v == "1")
         .unwrap_or(false))
-}
-
-/// "I2P-only" mode — disables the relay fallback so messages either go
-/// through I2P or fail. Used for shaking out the I2P transport without
-/// the relay quietly carrying the day. Persists in settings; takes
-/// effect immediately (every send re-reads it via `is_i2p_only`).
-#[tauri::command]
-pub async fn i2p_set_only_mode(
-    enabled: bool,
-    state: State<'_, std::sync::Arc<AppState>>,
-) -> CmdResult<()> {
-    let guard = state.vault.lock();
-    let rt = guard.as_ref().ok_or("vault locked")?;
-    rt.db
-        .settings_put("i2p_only_mode", if enabled { "1" } else { "0" })
-        .map_err(err)?;
-    tracing::info!("i2p: only-mode set to {enabled}");
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn i2p_get_only_mode(
-    state: State<'_, std::sync::Arc<AppState>>,
-) -> CmdResult<bool> {
-    let guard = state.vault.lock();
-    let rt = guard.as_ref().ok_or("vault locked")?;
-    Ok(rt
-        .db
-        .settings_get("i2p_only_mode")
-        .map_err(err)?
-        .map(|v| v == "1")
-        .unwrap_or(false))
-}
-
-/// Cheap predicate for the send paths to consult before falling back to
-/// relay. Reads the same `i2p_only_mode` setting; returns `false` when
-/// the vault is locked (defensive — failures don't accidentally enable
-/// relay for someone who explicitly disabled it).
-fn is_i2p_only(state: &std::sync::Arc<AppState>) -> bool {
-    let guard = state.vault.lock();
-    let Some(rt) = guard.as_ref() else { return false };
-    rt.db
-        .settings_get("i2p_only_mode")
-        .ok()
-        .flatten()
-        .map(|v| v == "1")
-        .unwrap_or(false)
 }
 
 #[tauri::command]
