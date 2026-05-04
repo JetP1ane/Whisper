@@ -20,12 +20,12 @@
 //! tunnel build on a fresh datadir can take 30-45s, but subsequent builds
 //! are 2-5s.
 
-use noctis_whisper_desktop_lib::transport::i2p::sam::{
-    self, default_session_options, SamReply,
+use noctis_whisper_desktop_lib::db::Database;
+use noctis_whisper_desktop_lib::transport::i2p::{
+    destination,
+    sam::{self, default_session_options, SamReply},
 };
 use std::time::Duration;
-use tokio::io::BufReader;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 fn sam_addr() -> Option<String> {
@@ -51,8 +51,7 @@ macro_rules! require_sam {
 #[tokio::test]
 async fn hello_handshake_negotiates_a_version() {
     let addr = require_sam!();
-    let tcp = TcpStream::connect(&addr).await.expect("connect SAM");
-    let mut buf = BufReader::new(tcp);
+    let mut buf = sam::connect(&addr).await.expect("connect SAM");
     let version = timeout(Duration::from_secs(10), sam::hello(&mut buf))
         .await
         .expect("HELLO timeout")
@@ -66,13 +65,53 @@ async fn hello_handshake_negotiates_a_version() {
 }
 
 #[tokio::test]
+async fn mint_and_store_destination_round_trips_through_sqlite() {
+    let addr = require_sam!();
+    let db = Database::open_in_memory_for_tests();
+    noctis_whisper_desktop_lib::db::schema::apply(&db.conn).expect("schema");
+    db.conn
+        .execute(
+            "INSERT INTO identity
+                (id, ed25519_public, ed25519_secret, x25519_public, x25519_secret,
+                 mlkem_public, mlkem_secret, alias, display_name, created_at)
+             VALUES ('self', x'', x'', x'', x'', x'', x'', 't-e-st', NULL, 0)",
+            [],
+        )
+        .expect("seed identity");
+
+    // Mint via SAM — this is the actual i2pd round trip.
+    let minted = timeout(
+        Duration::from_secs(20),
+        destination::mint_and_store(&db, &addr),
+    )
+    .await
+    .expect("mint timeout")
+    .expect("mint failed");
+    assert!(minted.pub_b64.len() > 400, "PUB suspiciously short: {}", minted.pub_b64.len());
+    assert!(minted.priv_b64.len() > 800, "PRIV suspiciously short: {}", minted.priv_b64.len());
+
+    // Read it back from the row — round trip without any network.
+    let loaded = destination::load(&db).unwrap().expect("destination present");
+    assert_eq!(loaded.pub_b64, minted.pub_b64);
+    assert_eq!(loaded.priv_b64, minted.priv_b64);
+
+    // load_or_mint should hit the existing row, not call the SAM bridge
+    // (we test the cache by passing an obviously-bad address — if it
+    // tried to hit the network it would error out).
+    let cached = timeout(
+        Duration::from_secs(2),
+        destination::load_or_mint(&db, "127.0.0.1:1"),
+    )
+    .await
+    .expect("load_or_mint timeout")
+    .expect("load_or_mint should hit cache");
+    assert_eq!(cached.pub_b64, minted.pub_b64);
+}
+
+#[tokio::test]
 async fn dest_generate_returns_pub_and_priv() {
     let addr = require_sam!();
-    let tcp = TcpStream::connect(&addr).await.expect("connect SAM");
-    tcp.set_nodelay(true).ok();
-    let mut buf = BufReader::new(tcp);
-    sam::hello(&mut buf).await.expect("HELLO");
-    let (pub_b64, priv_b64) = timeout(Duration::from_secs(10), sam::dest_generate(&mut buf))
+    let (pub_b64, priv_b64) = timeout(Duration::from_secs(10), sam::dest_generate_oneshot(&addr))
         .await
         .expect("DEST GENERATE timeout")
         .expect("DEST GENERATE failed");
@@ -90,18 +129,29 @@ async fn dest_generate_returns_pub_and_priv() {
 
 /// End-to-end smoke test: stand up a STREAM session, then in the same
 /// process open a STREAM ACCEPT and a STREAM CONNECT against ourselves
-/// and exchange a few bytes. This exercises every SAM verb Whisper uses
-/// in normal operation: HELLO, SESSION CREATE, STREAM ACCEPT, STREAM
-/// CONNECT, plus the actual byte transfer.
+/// and exchange a few bytes.
+///
+/// **Why `#[ignore]` by default**: I2P self-loopback through a single
+/// router fails with `CANT_REACH_PEER` until the encrypted leaseset
+/// publishes to a floodfill peer — typically 30-90s on a fresh datadir,
+/// and not always possible if the router doesn't have stable peers yet.
+/// The realistic test fixture (Phase 12) spins up TWO i2pd instances on
+/// the same host with cross-connected peer state and exchanges between
+/// them. Run this test only when you've already verified the router
+/// has built its leaseset:
+///
+/// ```sh
+/// curl -s http://127.0.0.1:7070/?page=local_destinations | grep -q published
+/// ```
 #[tokio::test]
+#[ignore = "self-loopback unreliable on single i2pd; see Phase 12 for two-router test"]
 async fn loopback_self_send_round_trips_through_i2p() {
     let addr = require_sam!();
 
     // --- Session: build it on a long-lived control socket. The control
     // socket must stay open for the lifetime of the session — closing it
     // tears down the session in i2pd.
-    let ctl_tcp = TcpStream::connect(&addr).await.expect("connect SAM ctl");
-    let mut ctl = BufReader::new(ctl_tcp);
+    let mut ctl = sam::connect(&addr).await.expect("connect SAM ctl");
     sam::hello(&mut ctl).await.expect("HELLO ctl");
 
     let session_id = format!("whisper-loopback-{}", std::process::id());

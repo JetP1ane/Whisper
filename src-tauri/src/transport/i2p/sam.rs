@@ -20,6 +20,20 @@ use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+/// Open a TCP connection to the SAM bridge with TCP_NODELAY set. SAM is
+/// extremely sensitive to write batching: with Nagle enabled, our second
+/// command (sent right after reading HELLO REPLY) can sit in the kernel
+/// for up to ~40 ms while i2pd is happy to half-close the socket if it
+/// thinks we've gone away. Disabling Nagle costs us nothing — every line
+/// we send is a deliberate command, never a small fragment of a larger
+/// stream — and eliminates a class of "Disconnected" bugs that took an
+/// hour to find the first time.
+pub async fn connect(bridge_addr: &str) -> I2pResult<BufReader<TcpStream>> {
+    let tcp = TcpStream::connect(bridge_addr).await?;
+    tcp.set_nodelay(true).ok();
+    Ok(BufReader::new(tcp))
+}
+
 /// One parsed `KEY=VALUE` line from the SAM bridge. The bridge always sends
 /// a verb (e.g. `HELLO REPLY`, `SESSION STATUS`) followed by k/v pairs.
 #[derive(Debug, Clone)]
@@ -59,22 +73,54 @@ where
 
 /// Parse a SAM reply line. SAM uses two-word verbs (`HELLO REPLY`,
 /// `SESSION STATUS`, `STREAM STATUS`, `DEST REPLY`, `NAMING REPLY`),
-/// followed by space-separated `KEY=VALUE` pairs. Values may be quoted
-/// (rare) — we accept simple unquoted forms which cover everything i2pd
-/// emits for our use cases.
+/// followed by space-separated `KEY=VALUE` pairs. `MESSAGE` values are
+/// often double-quoted because they contain spaces (e.g.
+/// `MESSAGE="Can't reach peer"`). We honor that.
 pub fn parse_reply(line: &str) -> I2pResult<SamReply> {
-    let mut tokens = line.split_whitespace();
-    let first = tokens.next().ok_or_else(|| I2pError::Sam("empty reply".into()))?;
-    let second = tokens.next().ok_or_else(|| I2pError::Sam("reply missing verb tail".into()))?;
+    // Pull off the two-word verb first.
+    let mut rest = line.trim_start();
+    let (first, r1) = split_word(rest)?;
+    rest = r1;
+    let (second, r2) = split_word(rest)?;
+    rest = r2.trim_start();
     let verb = format!("{first} {second}");
+
     let mut kv = HashMap::new();
-    for tok in tokens {
-        if let Some(eq) = tok.find('=') {
-            let (k, v) = tok.split_at(eq);
-            kv.insert(k.to_string(), v[1..].to_string());
-        }
+    while !rest.is_empty() {
+        let (k, after_eq) = match rest.find('=') {
+            Some(i) => (&rest[..i], &rest[i + 1..]),
+            None => break,
+        };
+        let (v, tail) = if after_eq.starts_with('"') {
+            // Quoted value: read up to closing quote. SAM doesn't escape
+            // quotes inside the value, so a simple find suffices.
+            let body = &after_eq[1..];
+            match body.find('"') {
+                Some(end) => (&body[..end], &body[end + 1..]),
+                None => (body, ""),
+            }
+        } else {
+            // Unquoted: read up to next whitespace.
+            match after_eq.find(char::is_whitespace) {
+                Some(i) => (&after_eq[..i], &after_eq[i..]),
+                None => (after_eq, ""),
+            }
+        };
+        kv.insert(k.to_string(), v.to_string());
+        rest = tail.trim_start();
     }
     Ok(SamReply { verb, kv })
+}
+
+fn split_word(s: &str) -> I2pResult<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return Err(I2pError::Sam("empty reply".into()));
+    }
+    Ok(match s.find(char::is_whitespace) {
+        Some(i) => (&s[..i], &s[i..]),
+        None => return Err(I2pError::Sam("reply missing verb tail".into())),
+    })
 }
 
 /// Send a SAM command line. SAM lines must terminate with `\n`; we don't
@@ -126,21 +172,23 @@ where
 }
 
 /// `DEST GENERATE` — ask the SAM bridge to mint a fresh destination
-/// keypair without creating a session. Used once at first launch so we
-/// can persist the private key in the vault, then later create sessions
-/// that adopt this same destination via `SESSION CREATE DESTINATION=…`.
+/// keypair without creating a session. Returns `(pub_b64, priv_b64)`.
 ///
-/// Returns `(pub_b64, priv_b64)` where `priv_b64` is the full I2P private
-/// destination format (signing key + crypto key + cert), the same blob
-/// `SESSION CREATE DESTINATION=` accepts.
-pub async fn dest_generate<RW>(rw: &mut BufReader<RW>) -> I2pResult<(String, String)>
-where
-    RW: AsyncRead + AsyncWrite + Unpin,
-{
+/// Stateless SAM commands (DEST GENERATE, NAMING LOOKUP, RAW SEND) MUST
+/// run on their own dedicated short-lived socket per the SAM v3.3 idiom:
+/// HELLO + one verb per socket, bridge closes after the reply. Mixing
+/// these onto a control socket that's already done HELLO causes i2pd to
+/// half-close the connection and we read EOF before the reply arrives.
+/// `dest_generate_oneshot` opens, hellos, asks, parses, and tears down
+/// in a single call — which is also how Whisper actually uses it
+/// (we mint a destination once at first launch and persist it).
+pub async fn dest_generate_oneshot(bridge_addr: &str) -> I2pResult<(String, String)> {
+    let mut buf = connect(bridge_addr).await?;
+    let _v = hello(&mut buf).await?;
     // 7 = EdDSA_SHA512_Ed25519 (SAM 3.1+ default but i2pd 2.60 only
     // accepts the numeric form on DEST GENERATE).
-    send_line(rw.get_mut(), "DEST GENERATE SIGNATURE_TYPE=7").await?;
-    let reply = read_reply(rw).await?;
+    send_line(buf.get_mut(), "DEST GENERATE SIGNATURE_TYPE=7").await?;
+    let reply = read_reply(&mut buf).await?;
     if reply.verb != "DEST REPLY" {
         return Err(I2pError::Sam(format!(
             "expected DEST REPLY, got `{}`",
@@ -245,8 +293,7 @@ pub async fn stream_connect(
     session_id: &str,
     peer_dest: &str,
 ) -> I2pResult<TcpStream> {
-    let tcp = TcpStream::connect(bridge_addr).await?;
-    let mut buf = BufReader::new(tcp);
+    let mut buf = connect(bridge_addr).await?;
     let _version = hello(&mut buf).await?;
     let cmd = format!(
         "STREAM CONNECT ID={session_id} DESTINATION={peer_dest} SILENT=false"
@@ -290,8 +337,7 @@ pub async fn stream_accept(
     bridge_addr: &str,
     session_id: &str,
 ) -> I2pResult<(TcpStream, String)> {
-    let tcp = TcpStream::connect(bridge_addr).await?;
-    let mut buf = BufReader::new(tcp);
+    let mut buf = connect(bridge_addr).await?;
     let _version = hello(&mut buf).await?;
     let cmd = format!("STREAM ACCEPT ID={session_id} SILENT=false");
     send_line(buf.get_mut(), &cmd).await?;
@@ -339,19 +385,17 @@ pub async fn stream_accept(
 }
 
 /// `NAMING LOOKUP` — resolve a short name (e.g. `whisper.alice.i2p`) to a
-/// full destination via i2pd's local address book. We don't *use* this
+/// full destination via i2pd's local address book. Stateless one-shot,
+/// same socket pattern as [`dest_generate_oneshot`]. We don't *use* this
 /// for Whisper today (contacts always exchange the full destination via
-/// the signed bundle) but it's cheap to keep around for diagnostics.
-pub async fn naming_lookup<RW>(
-    rw: &mut BufReader<RW>,
-    name: &str,
-) -> I2pResult<String>
-where
-    RW: AsyncRead + AsyncWrite + Unpin,
-{
+/// the signed bundle) but it's kept around for diagnostics + the special
+/// `ME` query which returns our own session destination.
+pub async fn naming_lookup_oneshot(bridge_addr: &str, name: &str) -> I2pResult<String> {
+    let mut buf = connect(bridge_addr).await?;
+    let _v = hello(&mut buf).await?;
     let cmd = format!("NAMING LOOKUP NAME={name}");
-    send_line(rw.get_mut(), &cmd).await?;
-    let reply = read_reply(rw).await?;
+    send_line(buf.get_mut(), &cmd).await?;
+    let reply = read_reply(&mut buf).await?;
     if reply.verb != "NAMING REPLY" {
         return Err(I2pError::Sam(format!(
             "expected NAMING REPLY, got `{}`",
@@ -413,6 +457,20 @@ mod tests {
         assert_eq!(r.verb, "SESSION STATUS");
         assert!(!r.ok());
         assert_eq!(r.result(), Some("DUPLICATED_ID"));
+        assert_eq!(r.message(), Some("already_taken"));
+    }
+
+    #[test]
+    fn parse_quoted_message_with_spaces() {
+        // Real i2pd reply format — MESSAGE is quoted because the human
+        // text contains spaces.
+        let r = parse_reply(
+            "STREAM STATUS RESULT=CANT_REACH_PEER MESSAGE=\"Can't reach peer\"",
+        )
+        .unwrap();
+        assert!(!r.ok());
+        assert_eq!(r.result(), Some("CANT_REACH_PEER"));
+        assert_eq!(r.message(), Some("Can't reach peer"));
     }
 
     #[test]

@@ -70,4 +70,19 @@ impl Database {
     pub fn close(self) {
         drop(self.conn);
     }
+
+    /// Open an in-memory database for tests. Skips the SQLCipher PRAGMA
+    /// dance (in-memory SQLite is process-private already) and does not
+    /// run the schema migration — callers do that explicitly so they can
+    /// layer additional fixtures around it.
+    ///
+    /// Always-public so integration tests under `tests/` can reach it;
+    /// production callers must use [`open`] which goes through SQLCipher.
+    #[doc(hidden)]
+    pub fn open_in_memory_for_tests() -> Self {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .expect("pragma");
+        Self { conn }
+    }
 }

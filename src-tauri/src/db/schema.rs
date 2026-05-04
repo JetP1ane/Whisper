@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS identity (
     alias           TEXT NOT NULL,
     display_name    TEXT,
     seed_entropy    BLOB,                   -- 16-byte BIP39 entropy (recovery)
+    -- I2P destination is independent from the Ed25519 identity so it can
+    -- be rotated without rotating identity (Mod #3). `i2p_dest_pub` is the
+    -- base64 public destination shared with peers; `i2p_dest_priv` is the
+    -- full private blob i2pd's SAM `SESSION CREATE DESTINATION=` accepts.
+    i2p_dest_pub    TEXT,
+    i2p_dest_priv   BLOB,
     created_at      INTEGER NOT NULL
 );
 
@@ -64,6 +70,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     x25519_public         BLOB NOT NULL,
     mlkem_public          BLOB NOT NULL,
     relay_url             TEXT,
+    -- I2P destination of the contact (base64). Populated from the signed
+    -- contact bundle exchange. The relay_url column above is now optional
+    -- and only set for legacy bundles; new bundles carry i2p_destination.
+    i2p_destination       TEXT,
     verified              INTEGER NOT NULL DEFAULT 0,
     peer_has_verified_us  INTEGER NOT NULL DEFAULT 0,
     hide_until_verified   INTEGER NOT NULL DEFAULT 0,
@@ -172,6 +182,9 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
     // column name" error and let it be a no-op on already-migrated DBs.
     let _ = conn.execute("ALTER TABLE contacts ADD COLUMN nickname TEXT", []);
     let _ = conn.execute("ALTER TABLE identity ADD COLUMN seed_entropy BLOB", []);
+    let _ = conn.execute("ALTER TABLE identity ADD COLUMN i2p_dest_pub TEXT", []);
+    let _ = conn.execute("ALTER TABLE identity ADD COLUMN i2p_dest_priv BLOB", []);
+    let _ = conn.execute("ALTER TABLE contacts ADD COLUMN i2p_destination TEXT", []);
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?1)",
         [CURRENT_VERSION.to_string()],
