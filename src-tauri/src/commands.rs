@@ -1487,6 +1487,16 @@ pub async fn message_send(
         return Ok(prepared.message.id);
     }
 
+    // I2P-only mode: no relay fallback. Mark the row failed and bail
+    // so the user can see the I2P transport is genuinely the only path.
+    if is_i2p_only(&state) {
+        let guard = state.vault.lock();
+        if let Some(rt) = guard.as_ref() {
+            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
+        }
+        return Err("i2p-only mode: I2P delivery failed and relay fallback is disabled".into());
+    }
+
     match prepared.target_relay_url.as_deref() {
         Some(target) => {
             tracing::info!(
@@ -1625,6 +1635,16 @@ pub async fn message_send_detonating(
         }
         emit_message_status_sent(&app, &prepared.msg_id);
         return Ok(prepared.message.id);
+    }
+
+    // I2P-only mode: no relay fallback. Mark the row failed and bail
+    // so the user can see the I2P transport is genuinely the only path.
+    if is_i2p_only(&state) {
+        let guard = state.vault.lock();
+        if let Some(rt) = guard.as_ref() {
+            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
+        }
+        return Err("i2p-only mode: I2P delivery failed and relay fallback is disabled".into());
     }
 
     match prepared.target_relay_url.as_deref() {
@@ -2208,6 +2228,14 @@ pub async fn message_send_attachment(
         return Ok(prepared.message.id);
     }
 
+    if is_i2p_only(&state) {
+        let guard = state.vault.lock();
+        if let Some(rt) = guard.as_ref() {
+            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
+        }
+        return Err("i2p-only mode: I2P delivery failed and relay fallback is disabled".into());
+    }
+
     match prepared.target_relay_url.as_deref() {
         Some(target) => {
             let pin = lookup_relay_pin(&state, target);
@@ -2379,6 +2407,53 @@ pub async fn i2p_get_transit_optin(
         .map_err(err)?
         .map(|v| v == "1")
         .unwrap_or(false))
+}
+
+/// "I2P-only" mode — disables the relay fallback so messages either go
+/// through I2P or fail. Used for shaking out the I2P transport without
+/// the relay quietly carrying the day. Persists in settings; takes
+/// effect immediately (every send re-reads it via `is_i2p_only`).
+#[tauri::command]
+pub async fn i2p_set_only_mode(
+    enabled: bool,
+    state: State<'_, std::sync::Arc<AppState>>,
+) -> CmdResult<()> {
+    let guard = state.vault.lock();
+    let rt = guard.as_ref().ok_or("vault locked")?;
+    rt.db
+        .settings_put("i2p_only_mode", if enabled { "1" } else { "0" })
+        .map_err(err)?;
+    tracing::info!("i2p: only-mode set to {enabled}");
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn i2p_get_only_mode(
+    state: State<'_, std::sync::Arc<AppState>>,
+) -> CmdResult<bool> {
+    let guard = state.vault.lock();
+    let rt = guard.as_ref().ok_or("vault locked")?;
+    Ok(rt
+        .db
+        .settings_get("i2p_only_mode")
+        .map_err(err)?
+        .map(|v| v == "1")
+        .unwrap_or(false))
+}
+
+/// Cheap predicate for the send paths to consult before falling back to
+/// relay. Reads the same `i2p_only_mode` setting; returns `false` when
+/// the vault is locked (defensive — failures don't accidentally enable
+/// relay for someone who explicitly disabled it).
+fn is_i2p_only(state: &std::sync::Arc<AppState>) -> bool {
+    let guard = state.vault.lock();
+    let Some(rt) = guard.as_ref() else { return false };
+    rt.db
+        .settings_get("i2p_only_mode")
+        .ok()
+        .flatten()
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 #[tauri::command]

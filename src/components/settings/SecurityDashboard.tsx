@@ -80,10 +80,63 @@ export function SecurityDashboard() {
             </div>
           </div>
         )}
+        <I2pOnlyModeRow />
         <TransitOptInRow />
       </div>
       <RecoveryPhraseRow />
     </section>
+  );
+}
+
+function I2pOnlyModeRow() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    invoke<boolean>("i2p_get_only_mode")
+      .then(setEnabled)
+      .catch(() => setEnabled(false));
+  }, []);
+
+  const toggle = async () => {
+    if (saving || enabled === null) return;
+    setSaving(true);
+    const next = !enabled;
+    try {
+      await invoke("i2p_set_only_mode", { enabled: next });
+      setEnabled(next);
+    } catch {
+      /* keep previous */
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (enabled === null) return null;
+  return (
+    <div className="mt-3 p-3 rounded-md bg-bg-inset border border-border-subtle">
+      <label className="flex items-start gap-3 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={toggle}
+          disabled={saving}
+          className="mt-0.5"
+        />
+        <span className="flex-1 text-[11px] text-text-secondary leading-snug">
+          <span className="block text-text-primary">
+            I2P only &mdash; disable relay fallback
+          </span>
+          <span className="block mt-0.5">
+            Sends only attempt I2P. If I2P can&rsquo;t reach the peer, the
+            message is marked failed instead of being carried by the
+            relay. Useful for testing the I2P transport in isolation.
+            Keep this off in normal use so messages still get through
+            during the I2P bootstrap window.
+          </span>
+        </span>
+      </label>
+    </div>
   );
 }
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { ContactList } from "../contacts/ContactList";
 import { RequestList } from "../contacts/RequestList";
 import { RoomList } from "../rooms/RoomList";
@@ -162,11 +163,84 @@ function IdentityCard({ identity }: { identity: IdentitySummary }) {
   );
 }
 
+interface I2pStatusPill {
+  ready: boolean;
+  destination: string;
+}
+interface RelayStatusPill {
+  connected: boolean;
+  url: string | null;
+}
+
 function RelayPill() {
+  const [i2p, setI2p] = useState<I2pStatusPill | null>(null);
+  const [relay, setRelay] = useState<RelayStatusPill | null>(null);
+  const [onlyMode, setOnlyMode] = useState<boolean>(false);
+
+  useEffect(() => {
+    const tick = async () => {
+      try {
+        setI2p(await invoke<I2pStatusPill>("i2p_status"));
+      } catch {
+        /* ignore */
+      }
+      try {
+        setRelay(await invoke<RelayStatusPill>("relay_status"));
+      } catch {
+        /* ignore */
+      }
+      try {
+        setOnlyMode(await invoke<boolean>("i2p_get_only_mode"));
+      } catch {
+        /* ignore */
+      }
+    };
+    tick();
+    const t = setInterval(tick, 5_000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Decide what the indicator should say. Priority:
+  //   1. I2P-only mode and I2P is up   → "i2p (only)"
+  //   2. I2P-only mode and I2P is down → "i2p offline"
+  //   3. I2P up                        → "i2p · relay"
+  //   4. Only relay up                 → "relay only"
+  //   5. Neither                       → "offline"
+  let label: string;
+  let dotClass: string;
+  if (onlyMode) {
+    if (i2p?.ready) {
+      label = "i2p (only)";
+      dotClass = "bg-status-ok";
+    } else {
+      label = "i2p offline";
+      dotClass = "bg-status-err";
+    }
+  } else if (i2p?.ready && relay?.connected) {
+    label = "i2p · relay";
+    dotClass = "bg-status-ok";
+  } else if (i2p?.ready) {
+    label = "i2p";
+    dotClass = "bg-status-ok";
+  } else if (relay?.connected) {
+    label = "relay only";
+    dotClass = "bg-status-warn";
+  } else {
+    label = "offline";
+    dotClass = "bg-status-err";
+  }
+
   return (
-    <div className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-bg-inset">
-      <span className="w-1.5 h-1.5 rounded-full bg-status-ok shrink-0" />
-      <span className="text-xs text-text-secondary truncate">relay.local</span>
+    <div
+      className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-bg-inset"
+      title={
+        onlyMode
+          ? "I2P-only mode is on (relay fallback disabled)"
+          : "Sends try I2P first, fall back to relay if unreachable"
+      }
+    >
+      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotClass}`} />
+      <span className="text-xs text-text-secondary truncate font-mono">{label}</span>
     </div>
   );
 }

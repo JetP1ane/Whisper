@@ -62,6 +62,8 @@ pub fn run() {
             commands::i2p_status,
             commands::i2p_get_transit_optin,
             commands::i2p_set_transit_optin,
+            commands::i2p_get_only_mode,
+            commands::i2p_set_only_mode,
             commands::relay_set_url,
             commands::relay_connect,
             commands::relay_change_url,
