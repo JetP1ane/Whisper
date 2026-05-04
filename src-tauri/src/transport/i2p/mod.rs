@@ -89,6 +89,11 @@ pub const I2CP_LEASESET_ENC_TYPE_ECIES_X25519: u8 = 4;
 /// (Mod: in design proposal §2 "Connection keep-alive").
 pub const STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
 
-/// Max single-message frame size we'll accept on an inbound stream. Bigger
-/// payloads (file chunks) are explicitly streamed in chunks of this size.
-pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024; // 1 MiB
+/// Max single-message frame size we'll accept on an inbound stream.
+/// Sized to cover the 10 MiB attachment cap (`crypto::MAX_ATTACHMENT_BYTES`)
+/// plus envelope overhead in a single frame, which keeps the attachment
+/// path simple — one frame in, one ACK out, no chunked reassembly.
+/// A future polish pass can lower this and route bigger payloads
+/// through streamed `FileChunk` frames; today the framing layer just
+/// rejects anything larger.
+pub const MAX_FRAME_PAYLOAD: usize = 12 * 1024 * 1024;

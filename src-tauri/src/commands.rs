@@ -2245,6 +2245,94 @@ pub async fn relay_status(state: State<'_, std::sync::Arc<AppState>>) -> CmdResu
     })
 }
 
+/// Snapshot of the I2P transport state for the security dashboard.
+#[derive(Serialize)]
+pub struct I2pStatus {
+    /// True iff the I2P runtime is up: i2pd subprocess running, master
+    /// session created, inbound accept loop and queue worker active.
+    pub ready: bool,
+    /// Our public destination (base64). Empty string when not ready —
+    /// the frontend renders "—" rather than displaying the empty value.
+    pub destination: String,
+    /// Master STREAM session ID (uuid). Useful for diagnostics; not
+    /// secret. Empty when not ready.
+    pub session_id: String,
+    /// SAM bridge address (e.g. `127.0.0.1:49243`). Useful for
+    /// diagnostics; the random ephemeral port confirms Mod #1 is in
+    /// effect. Empty when not ready.
+    pub sam_addr: String,
+    /// Path to the per-profile i2pd log file. The dashboard renders
+    /// this as a clickable open-in-Console link.
+    pub log_path: String,
+    /// Cached outbound stream count — non-zero means there's at least
+    /// one active conversation tunnel held warm for keep-alive.
+    pub cached_outbound_streams: usize,
+}
+
+/// Opt the user in (or out) of contributing to I2P transit routing.
+/// Setting takes effect on the next vault unlock — i2pd has to restart
+/// to reconfigure transit. We don't auto-restart here because that's
+/// disruptive; the dashboard surfaces a "restart i2pd to apply" hint
+/// when this changes.
+#[tauri::command]
+pub async fn i2p_set_transit_optin(
+    enabled: bool,
+    state: State<'_, std::sync::Arc<AppState>>,
+) -> CmdResult<()> {
+    let guard = state.vault.lock();
+    let rt = guard.as_ref().ok_or("vault locked")?;
+    rt.db
+        .settings_put("i2p_enable_transit", if enabled { "1" } else { "0" })
+        .map_err(err)?;
+    tracing::info!("i2p: transit opt-in set to {enabled} (effective on next unlock)");
+    Ok(())
+}
+
+/// Read the user's current transit opt-in preference. `false` until
+/// they explicitly toggle it on (Mod #1 default).
+#[tauri::command]
+pub async fn i2p_get_transit_optin(
+    state: State<'_, std::sync::Arc<AppState>>,
+) -> CmdResult<bool> {
+    let guard = state.vault.lock();
+    let rt = guard.as_ref().ok_or("vault locked")?;
+    Ok(rt
+        .db
+        .settings_get("i2p_enable_transit")
+        .map_err(err)?
+        .map(|v| v == "1")
+        .unwrap_or(false))
+}
+
+#[tauri::command]
+pub async fn i2p_status(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<I2pStatus> {
+    let runtime = {
+        let slot = state.i2p.lock().await;
+        slot.as_ref().cloned()
+    };
+    match runtime {
+        Some(rt) => {
+            let cached_outbound_streams = rt.connection.cached_outbound_count().await;
+            Ok(I2pStatus {
+                ready: true,
+                destination: rt.manager.destination_pub().to_string(),
+                session_id: rt.manager.session_id().to_string(),
+                sam_addr: rt.manager.sam_addr().to_string(),
+                log_path: rt.manager.log_path().to_string_lossy().into_owned(),
+                cached_outbound_streams,
+            })
+        }
+        None => Ok(I2pStatus {
+            ready: false,
+            destination: String::new(),
+            session_id: String::new(),
+            sam_addr: String::new(),
+            log_path: String::new(),
+            cached_outbound_streams: 0,
+        }),
+    }
+}
+
 /// Change the home relay URL: persist, re-sign manifest, reconnect, and
 /// broadcast `relay_update` envelopes to every contact so they route future
 /// deposits to the new URL. Records the previous URL to enable 14-day

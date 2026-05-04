@@ -59,6 +59,9 @@ pub fn run() {
             commands::attachment_save_as,
             // relay
             commands::relay_status,
+            commands::i2p_status,
+            commands::i2p_get_transit_optin,
+            commands::i2p_set_transit_optin,
             commands::relay_set_url,
             commands::relay_connect,
             commands::relay_change_url,
@@ -121,8 +124,70 @@ pub fn run() {
                     .try_init()
                     .ok();
             }
+            // macOS menu-bar helper: keep the app + i2pd running when the
+            // user closes the main window. Caveat #6 in the I2P design
+            // proposal — without this, "must be online to deliver"
+            // becomes "must keep the app window open to deliver,"
+            // because i2pd dies when the process exits. This pattern
+            // matches Discord/Slack/Spotify on macOS — close hides,
+            // explicit Quit from the tray actually exits.
+            install_tray(app)?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Intercept the user clicking the close button on the main
+            // window: hide instead of letting the OS close+exit. The
+            // tray icon's "Quit Whisper" menu item is the only way to
+            // actually exit.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("error running Noctis Whisper");
+}
+
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+    use tauri::Manager;
+
+    let open_item = MenuItem::with_id(app, "open", "Open Whisper", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "Quit Whisper", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+
+    TrayIconBuilder::with_id("noctis-whisper-tray")
+        .tooltip("Noctis Whisper")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+            "quit" => {
+                tracing::info!("tray: Quit selected — exiting");
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // Left-click on the tray icon shows the main window — same
+            // behavior most macOS menu-bar apps adopt. Right-click /
+            // long-press still opens the menu.
+            if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+                if let Some(w) = tray.app_handle().get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                }
+            }
+        })
+        .build(app)?;
+    Ok(())
 }

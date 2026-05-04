@@ -17,13 +17,28 @@ interface SecurityStatus {
   frame_counters: Snapshot;
 }
 
+interface I2pStatus {
+  ready: boolean;
+  destination: string;
+  session_id: string;
+  sam_addr: string;
+  log_path: string;
+  cached_outbound_streams: number;
+}
+
 export function SecurityDashboard() {
   const [status, setStatus] = useState<SecurityStatus | null>(null);
+  const [i2p, setI2p] = useState<I2pStatus | null>(null);
 
   useEffect(() => {
     const tick = async () => {
       try {
         setStatus(await invoke<SecurityStatus>("security_status"));
+      } catch {
+        /* ignore */
+      }
+      try {
+        setI2p(await invoke<I2pStatus>("i2p_status"));
       } catch {
         /* ignore */
       }
@@ -44,17 +59,81 @@ export function SecurityDashboard() {
         <div className="grid grid-cols-2 gap-2">
           <Card label="Vault" ok={status.vault_unlocked} value={status.vault_unlocked ? "Unlocked" : "Locked"} />
           <Card label="Hardware" ok={status.hardware_tier !== "none"} value={prettyTier(status.hardware_tier)} />
-          <Card label="Relay" ok={status.relay_connected} value={status.relay_url ?? "—"} />
           <Card
-            label="Frames"
-            ok
-            value={`${status.frame_counters.frames_sent} ↑ / ${status.frame_counters.frames_received} ↓`}
-            mono
+            label="I2P"
+            ok={i2p?.ready ?? false}
+            value={i2p?.ready ? `Connected (${i2p.cached_outbound_streams} streams)` : "Starting…"}
           />
+          <Card label="Relay (fallback)" ok={status.relay_connected} value={status.relay_url ?? "—"} />
         </div>
+        {i2p?.ready && (
+          <div className="mt-3 p-3 rounded-md bg-bg-inset border border-border-subtle space-y-1">
+            <div className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
+              I2P destination
+            </div>
+            <div className="text-[10px] font-mono text-text-secondary break-all leading-relaxed">
+              {i2p.destination}
+            </div>
+            <div className="mt-2 text-[10px] text-text-tertiary">
+              SAM: <span className="font-mono">{i2p.sam_addr}</span> · Session:{" "}
+              <span className="font-mono">{i2p.session_id.slice(0, 12)}…</span>
+            </div>
+          </div>
+        )}
+        <TransitOptInRow />
       </div>
       <RecoveryPhraseRow />
     </section>
+  );
+}
+
+function TransitOptInRow() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    invoke<boolean>("i2p_get_transit_optin")
+      .then(setEnabled)
+      .catch(() => setEnabled(false));
+  }, []);
+
+  const toggle = async () => {
+    if (saving || enabled === null) return;
+    setSaving(true);
+    const next = !enabled;
+    try {
+      await invoke("i2p_set_transit_optin", { enabled: next });
+      setEnabled(next);
+    } catch {
+      /* keep previous */
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (enabled === null) return null;
+  return (
+    <div className="mt-3 p-3 rounded-md bg-bg-inset border border-border-subtle">
+      <label className="flex items-start gap-3 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={toggle}
+          disabled={saving}
+          className="mt-0.5"
+        />
+        <span className="flex-1 text-[11px] text-text-secondary leading-snug">
+          <span className="block text-text-primary">
+            Help strengthen the privacy network
+          </span>
+          <span className="block mt-0.5">
+            Relay encrypted traffic for other I2P users. You can&rsquo;t see or access
+            this traffic. Recommended on Wi-Fi; off by default. Restart the vault
+            (lock + unlock) to apply changes.
+          </span>
+        </span>
+      </label>
+    </div>
   );
 }
 
