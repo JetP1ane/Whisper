@@ -291,6 +291,30 @@ impl I2PManager {
             destination.priv_b64.len()
         );
 
+        // Build the encrypted-leaseset DH-auth list from the secondary
+        // DB: our own X25519 private key (used by i2pd to decrypt
+        // incoming leaseset lookups when WE dial peers) plus the X25519
+        // public key of every known contact (so each contact can
+        // resolve OUR leaseset and dial us). New contacts added during
+        // this session can't reach us until next vault unlock — auto-
+        // cycling sessions on contact change is a follow-up.
+        let (our_x_priv, contact_pubs) = {
+            let guard = db.lock();
+            (
+                read_identity_x25519_priv(&guard).unwrap_or([0u8; 32]),
+                read_contact_x25519_pubs(&guard),
+            )
+        };
+        let auth_opts = sam::encrypted_leaseset_options(&our_x_priv, &contact_pubs);
+        let auth_opt_refs: Vec<(&str, &str)> = auth_opts
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        tracing::info!(
+            "i2p: encrypted leaseset auth list: {} contact(s)",
+            contact_pubs.len()
+        );
+
         let session_id = format!("whisper-{}", uuid::Uuid::new_v4().simple());
         let mut control = sam::connect(&sam_addr).await?;
         let _v = sam::hello(&mut control).await?;
@@ -298,7 +322,7 @@ impl I2PManager {
             &mut control,
             &session_id,
             &destination.priv_b64,
-            &[],
+            &auth_opt_refs,
         )
         .await?;
         tracing::info!("i2p: master STREAM session `{session_id}` created");
@@ -430,6 +454,51 @@ profiles = true
 "#
     );
     std::fs::write(path, body)
+}
+
+/// Pull our identity X25519 private key out of the secondary DB. Used
+/// to populate `i2cp.leaseSetPrivKey` so i2pd can decrypt encrypted
+/// leasesets sent BY peers we've authorized ourselves with.
+fn read_identity_x25519_priv(db: &Database) -> Option<[u8; 32]> {
+    let mut stmt = db
+        .conn
+        .prepare("SELECT x25519_secret FROM identity WHERE id = 'self' LIMIT 1")
+        .ok()?;
+    let mut rows = stmt.query([]).ok()?;
+    let row = rows.next().ok()??;
+    let bytes: Vec<u8> = row.get(0).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Some(arr)
+}
+
+/// Pull every known contact's X25519 public key from the secondary DB.
+/// These become the authorized recipient list on our encrypted
+/// leaseset — only peers in this list can resolve our destination via
+/// the floodfills.
+fn read_contact_x25519_pubs(db: &Database) -> Vec<[u8; 32]> {
+    let mut stmt = match db.conn.prepare("SELECT x25519_public FROM contacts") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt
+        .query_map([], |r| r.get::<_, Vec<u8>>(0))
+        .ok();
+    let Some(rows) = rows else { return Vec::new() };
+    rows.flatten()
+        .filter_map(|v| {
+            if v.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&v);
+                Some(arr)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Recursive directory copy used to bootstrap i2pd's certificate bundle

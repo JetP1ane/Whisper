@@ -222,15 +222,22 @@ pub fn default_session_options() -> Vec<(&'static str, &'static str)> {
         ("outbound.length", "2"),
         ("inbound.quantity", "3"),
         ("outbound.quantity", "3"),
-        // LS2 with ECIES-X25519-AEAD on-wire crypto (recommended). We
-        // omit `leaseSetType=5` (encrypted leaseset to a specific
-        // audience) for now because that requires per-client DH auth
-        // (`leaseSetAuthType=2`) plumbing that we don't yet have. With
-        // type=3 (LS2) any peer who knows the destination can resolve
-        // the leaseset and dial — same security envelope as before
-        // (destinations are only ever shared via signed bundles, never
-        // a public directory). See Mod #2 followup.
-        ("i2cp.leaseSetType", "3"),
+        // Encrypted LS2 (type 5) with ECIES-X25519-AEAD on-wire encryption
+        // and per-client DH authorization (authType=1). The owner provides
+        // a list of authorized recipient X25519 public keys via the
+        // `i2cp.leaseSetClient.NN.dh` options the *caller* appends after
+        // these defaults; without that list the bridge will reject the
+        // session create. The owner's own X25519 private key is supplied
+        // via `i2cp.leaseSetPrivKey` so the bridge can decrypt incoming
+        // leaseset lookups when this peer dials others.
+        //
+        // Net effect: floodfill operators store an opaque blob for our
+        // destination; only contacts whose pubkey is in our auth list
+        // can decrypt the leaseset and route to us. Solves the "anyone
+        // who once got our bundle can monitor when we're online" leak
+        // of plain LS2.
+        ("i2cp.leaseSetType", "5"),
+        ("i2cp.leaseSetAuthType", "1"),
         ("i2cp.leaseSetEncType", "4"),
     ]
 }
@@ -286,6 +293,52 @@ where
         .cloned()
         .ok_or_else(|| I2pError::Sam("SESSION STATUS missing DESTINATION".into()))?;
     Ok(dest)
+}
+
+/// Build the encrypted-leaseset DH-auth options for a SESSION CREATE.
+///
+/// Returns the options as owned strings (caller will reborrow as
+/// `&[(&str, &str)]` for `session_create_stream`'s `extra_opts`). The
+/// pair list is:
+///
+///   `i2cp.leaseSetPrivKey`           = `<our_x25519_priv_b64>`
+///   `i2cp.leaseSetClient.0.dh`       = `<contact_0_x25519_pub_b64>`
+///   `i2cp.leaseSetClient.1.dh`       = `<contact_1_x25519_pub_b64>`
+///   ...
+///
+/// Both keys use standard base64 (`+/=`) — that's what i2pd's SAM
+/// accepts for these I2CP options. The destination format itself uses
+/// I2P's `-~` alphabet but those are negotiated via DEST GENERATE /
+/// SESSION CREATE, not via these per-client options.
+///
+/// `our_x25519_priv` is our identity X25519 secret (32 bytes). Reusing
+/// it from PQ-X3DH means we don't need a new key class, and contact
+/// bundles already carry the matching public key for the auth list on
+/// the other side. The trade-off is that this single key proves both
+/// "I'm the owner of this Whisper identity" and "I can decrypt
+/// leaseset metadata for sessions that authorized me" — fine for our
+/// threat model (both usages are bound to the same vault).
+///
+/// `contact_x25519_pubs` is the list of contact public keys that should
+/// be authorized to resolve our leaseset. Order doesn't matter; the
+/// helper assigns indices automatically.
+pub fn encrypted_leaseset_options(
+    our_x25519_priv: &[u8; 32],
+    contact_x25519_pubs: &[[u8; 32]],
+) -> Vec<(String, String)> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let mut opts = Vec::with_capacity(1 + contact_x25519_pubs.len());
+    opts.push((
+        "i2cp.leaseSetPrivKey".to_string(),
+        STANDARD.encode(our_x25519_priv),
+    ));
+    for (i, pubkey) in contact_x25519_pubs.iter().enumerate() {
+        opts.push((
+            format!("i2cp.leaseSetClient.{i}.dh"),
+            STANDARD.encode(pubkey),
+        ));
+    }
+    opts
 }
 
 /// `STREAM CONNECT` — open a new SAM socket, hello, then ask the bridge
@@ -510,14 +563,44 @@ mod tests {
     }
 
     #[test]
-    fn default_session_options_use_ls2_with_ecies() {
+    fn default_session_options_use_encrypted_ls2_with_dh_auth() {
         let opts = default_session_options();
         let m: std::collections::HashMap<_, _> = opts.into_iter().collect();
-        // LS2 (type 3) with ECIES-X25519-AEAD on-wire encryption.
-        // Encrypted leasesets (type 5) are deferred until per-client
-        // auth is wired.
-        assert_eq!(m.get("i2cp.leaseSetType"), Some(&"3"));
+        // Encrypted LS2 (type 5) with per-client DH auth (authType 1)
+        // and ECIES-X25519-AEAD on-wire encryption (encType 4).
+        assert_eq!(m.get("i2cp.leaseSetType"), Some(&"5"));
+        assert_eq!(m.get("i2cp.leaseSetAuthType"), Some(&"1"));
         assert_eq!(m.get("i2cp.leaseSetEncType"), Some(&"4"));
         assert_eq!(m.get("SIGNATURE_TYPE"), Some(&"7"));
+    }
+
+    #[test]
+    fn encrypted_leaseset_options_layout() {
+        let our_priv = [0x11u8; 32];
+        let contact_a = [0xAAu8; 32];
+        let contact_b = [0xBBu8; 32];
+        let opts = encrypted_leaseset_options(&our_priv, &[contact_a, contact_b]);
+        // First entry must be our priv key (i2pd reads it before scanning
+        // the per-client list).
+        assert_eq!(opts[0].0, "i2cp.leaseSetPrivKey");
+        // Per-client entries indexed from 0.
+        assert_eq!(opts[1].0, "i2cp.leaseSetClient.0.dh");
+        assert_eq!(opts[2].0, "i2cp.leaseSetClient.1.dh");
+        // Values are base64-encoded 32-byte keys.
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        assert_eq!(STANDARD.decode(&opts[0].1).unwrap(), our_priv.to_vec());
+        assert_eq!(STANDARD.decode(&opts[1].1).unwrap(), contact_a.to_vec());
+        assert_eq!(STANDARD.decode(&opts[2].1).unwrap(), contact_b.to_vec());
+    }
+
+    #[test]
+    fn encrypted_leaseset_options_handles_zero_contacts() {
+        // Bootstrapping case: no contacts yet. The session still gets
+        // our priv key so we can dial others; auth list is empty so
+        // the leaseset accepts no incoming dials. (Caller may decide
+        // to defer session creation until at least one contact exists.)
+        let opts = encrypted_leaseset_options(&[0u8; 32], &[]);
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0].0, "i2cp.leaseSetPrivKey");
     }
 }
