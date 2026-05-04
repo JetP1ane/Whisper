@@ -205,8 +205,9 @@ pub struct VaultSetupResult {
 pub async fn vault_setup(
     passphrase: String,
     state: State<'_, std::sync::Arc<AppState>>,
+    app: tauri::AppHandle,
 ) -> CmdResult<VaultSetupResult> {
-    setup_or_restore(passphrase, None, state).await
+    setup_or_restore(passphrase, None, state, app).await
 }
 
 /// Destructive: blow away the Keychain blob, the SQLCipher DB, and the
@@ -286,14 +287,16 @@ pub async fn vault_recover_from_seed(
     passphrase: String,
     recovery_phrase: String,
     state: State<'_, std::sync::Arc<AppState>>,
+    app: tauri::AppHandle,
 ) -> CmdResult<VaultSetupResult> {
-    setup_or_restore(passphrase, Some(recovery_phrase), state).await
+    setup_or_restore(passphrase, Some(recovery_phrase), state, app).await
 }
 
 async fn setup_or_restore(
     passphrase: String,
     existing_phrase: Option<String>,
     state: State<'_, std::sync::Arc<AppState>>,
+    app: tauri::AppHandle,
 ) -> CmdResult<VaultSetupResult> {
     // Recovery from a known seed phrase is also our "I lost my passphrase"
     // recovery path, so we let the caller wipe-and-rebuild when the vault
@@ -371,6 +374,18 @@ async fn setup_or_restore(
         .map_err(err)?;
 
     *state.vault.lock() = Some(runtime);
+
+    // Same as vault_unlock — spawn I2P in the background. Without
+    // this, a fresh-install user who completes BIP39 onboarding never
+    // brings up i2pd until they lock + unlock.
+    let dek_clone = state
+        .vault
+        .lock()
+        .as_ref()
+        .map(|rt| rt.dek.to_vec())
+        .ok_or("vault locked between setup and i2p spawn")?;
+    spawn_i2p_start(std::sync::Arc::clone(&state), app, dek_clone);
+
     Ok(VaultSetupResult {
         recovery_phrase,
         alias,

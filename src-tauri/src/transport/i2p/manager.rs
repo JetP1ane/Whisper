@@ -55,31 +55,37 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
 /// Where to look for the i2pd binary, in priority order.
+///
+/// Production: bundled inside `Noctis Whisper.app/Contents/Resources/
+/// i2pd-bundle/i2pd`, with its dylibs alongside under `i2pd-bundle/lib/`.
+/// The bundle is produced by `scripts/bundle-i2pd.sh` and copied into
+/// the .app by Tauri's `bundle.resources` config in `tauri.conf.json`.
+///
+/// Dev: Homebrew at `/opt/homebrew/opt/i2pd/bin/i2pd`. Tests can set
+/// `WHISPER_I2PD_BINARY` to point at a custom build.
 fn locate_i2pd_binary() -> I2pResult<PathBuf> {
-    // 1. Explicit override (CI / dev box with a custom build).
     if let Ok(p) = std::env::var("WHISPER_I2PD_BINARY") {
         let path = PathBuf::from(p);
         if path.is_file() {
             return Ok(path);
         }
     }
-    // 2. Bundled inside the .app: <app>/Contents/Resources/i2pd. We don't
-    //    have a Tauri-blessed resource resolver in pure-Rust modules, so
-    //    we walk up from the current exe — works for the production
-    //    launch path (the main binary's parent's parent is `Contents/`).
+    // Bundled inside the .app. Walk up from the current exe path:
+    // exe is at .../Contents/MacOS/<app>; go to Contents/Resources/
+    // and into i2pd-bundle/.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(macos_dir) = exe.parent() {
-            // exe lives at .../Contents/MacOS/<app>; go up to Contents/
-            // and into Resources/.
             if let Some(contents) = macos_dir.parent() {
-                let bundled = contents.join("Resources").join("i2pd");
+                let bundled = contents
+                    .join("Resources")
+                    .join("i2pd-bundle")
+                    .join("i2pd");
                 if bundled.is_file() {
                     return Ok(bundled);
                 }
             }
         }
     }
-    // 3. Homebrew (dev).
     let brew = PathBuf::from("/opt/homebrew/opt/i2pd/bin/i2pd");
     if brew.is_file() {
         return Ok(brew);
@@ -89,7 +95,7 @@ fn locate_i2pd_binary() -> I2pResult<PathBuf> {
         return Ok(brew_intel);
     }
     Err(I2pError::Subprocess(
-        "i2pd binary not found (set WHISPER_I2PD_BINARY, install via brew, or bundle in Resources/)"
+        "i2pd binary not found (set WHISPER_I2PD_BINARY, install via brew, or bundle in Resources/i2pd-bundle/)"
             .into(),
     ))
 }
@@ -105,10 +111,14 @@ fn locate_i2pd_certificates() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    // Production: Resources/i2pd-bundle/certificates/ alongside the binary.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(macos_dir) = exe.parent() {
             if let Some(contents) = macos_dir.parent() {
-                let bundled = contents.join("Resources").join("certificates");
+                let bundled = contents
+                    .join("Resources")
+                    .join("i2pd-bundle")
+                    .join("certificates");
                 if bundled.is_dir() {
                     return Some(bundled);
                 }

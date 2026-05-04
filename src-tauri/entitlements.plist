@@ -2,14 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- App Sandbox.
-         DEV NOTE: temporarily disabled while we use the Homebrew i2pd
-         binary at /opt/homebrew/opt/i2pd/bin/i2pd. Sandbox forbids
-         spawning processes outside the container. Phase 2.5 will
-         bundle i2pd into Contents/Resources/ and codesign it, at which
-         point this flips back to <true/>. -->
+    <!-- App Sandbox enabled. The bundled i2pd lives inside
+         Contents/Resources/i2pd-bundle/ and is codesigned alongside
+         the main app, so spawning it is allowed under the sandbox. -->
     <key>com.apple.security.app-sandbox</key>
-    <false/>
+    <true/>
 
     <!-- Hardened Runtime: only what we need -->
     <key>com.apple.security.network.client</key>

@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "bundle:i2pd": "scripts/bundle-i2pd.sh",
+    "tauri:build": "scripts/bundle-i2pd.sh && tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
