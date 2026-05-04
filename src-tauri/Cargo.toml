@@ -69,6 +69,10 @@ x509-parser = "0.16"
 # --- database ---
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 
+# --- POSIX bits (SIGTERM for graceful i2pd shutdown) ---
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # --- macOS Secure Enclave / Keychain ---
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"

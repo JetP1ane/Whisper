@@ -2542,6 +2542,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "once_cell",
  "parking_lot",
  "pbkdf2",

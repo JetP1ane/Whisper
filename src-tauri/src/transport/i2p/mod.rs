@@ -30,7 +30,10 @@
 //!   - Phase 4: persistent send queue
 //!   - Phases 5+: bundle / DB / commands / files / groups / tray / tests
 
+pub mod connection;
 pub mod destination;
+pub mod framing;
+pub mod manager;
 pub mod sam;
 
 use thiserror::Error;
