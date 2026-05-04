@@ -326,11 +326,30 @@ async fn handle_inbound_stream(
                 let hash = Sha256::digest(&frame.payload);
                 let mut hash_arr = [0u8; 32];
                 hash_arr.copy_from_slice(&hash);
-                handler(peer_dest.clone(), frame).await?;
-                // ACK with the SHA-256 of what we received so the sender
-                // can verify nothing got mangled in transit.
-                write_frame(&mut stream, &Frame::ack(hash_arr)).await?;
-                stream.flush().await?;
+                // Run the handler FIRST and only ACK on success. If
+                // dispatch fails (e.g. AEAD tag mismatch from a
+                // ratchet-state desync), DON'T ACK — that way the
+                // sender sees a delivery failure instead of thinking
+                // the message landed when the recipient actually
+                // couldn't decrypt it. This makes ratchet desyncs
+                // visible at the UI layer immediately.
+                match handler(peer_dest.clone(), frame).await {
+                    Ok(()) => {
+                        write_frame(&mut stream, &Frame::ack(hash_arr)).await?;
+                        stream.flush().await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "i2p: handler rejected frame from {}: {e} \
+                             (no ACK — sender will see undelivered)",
+                            &peer_dest[..16.min(peer_dest.len())]
+                        );
+                        // Drop the connection so the sender sees an
+                        // explicit failure rather than a hang.
+                        let _ = stream.shutdown().await;
+                        return Ok(());
+                    }
+                }
             }
             FrameType::Unknown(code) => {
                 tracing::debug!("i2p: ignoring unknown frame type 0x{code:02x}");

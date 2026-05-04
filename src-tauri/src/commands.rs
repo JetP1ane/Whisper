@@ -554,6 +554,13 @@ fn spawn_i2p_start(
                     use crate::transport::i2p::framing::FrameType;
                     match frame.kind {
                         FrameType::Message | FrameType::FileMetadata => {
+                            // Propagate the result back to the
+                            // ConnectionManager so it can choose NOT
+                            // to ACK on dispatch failure. Without this,
+                            // a ratchet-desync AEAD failure would still
+                            // ACK and the sender would see "delivered"
+                            // for a message the recipient couldn't
+                            // decrypt — a confusing silent loss.
                             if let Err(e) = crate::messaging::inbound::dispatch_i2p_frame(
                                 &app,
                                 &state,
@@ -566,6 +573,9 @@ fn spawn_i2p_start(
                                     "i2p: inbound dispatch failed for {}: {e:#}",
                                     &peer_dest[..16.min(peer_dest.len())]
                                 );
+                                return Err(crate::transport::i2p::I2pError::Sam(format!(
+                                    "dispatch: {e}"
+                                )));
                             }
                         }
                         FrameType::FileChunk => {
