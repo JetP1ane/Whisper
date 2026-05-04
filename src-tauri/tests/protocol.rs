@@ -95,6 +95,7 @@ fn build_published_bundle(
         derive_alias(&keys.ed25519_verifying().to_bytes()),
         None,
         "wss://test.example.com/ws".into(),
+        String::new(),
     )
 }
 
@@ -466,6 +467,7 @@ fn bundle_alias_substitution_is_rejected() {
         bob_alias.clone(),
         None,
         "wss://eve.example.com/ws".into(),
+        String::new(),
     );
 
     // Eve's signature on her own bundle is structurally valid, but the

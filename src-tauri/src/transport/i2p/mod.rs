@@ -34,6 +34,7 @@ pub mod connection;
 pub mod destination;
 pub mod framing;
 pub mod manager;
+pub mod queue;
 pub mod sam;
 
 use thiserror::Error;

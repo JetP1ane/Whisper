@@ -138,6 +138,7 @@ fn build_bundle(
         ),
         None,
         relay_url.to_string(),
+        String::new(), // i2p_destination — empty for legacy relay test
     )
 }
 

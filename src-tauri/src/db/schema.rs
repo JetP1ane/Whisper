@@ -173,6 +173,26 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- I2P send queue. Outbound message blobs that haven't been ACK'd by the
+-- peer yet. The queue worker walks this on a backoff schedule and retries
+-- delivery via ConnectionManager::send_blob. Rows expire after 30 days.
+CREATE TABLE IF NOT EXISTS i2p_send_queue (
+    id                  TEXT PRIMARY KEY,        -- random UUID for the queue entry
+    contact_id          TEXT NOT NULL,
+    message_id          TEXT NOT NULL,           -- ref. into messages table for status updates
+    contact_destination TEXT NOT NULL,           -- peer's i2p_destination (b64) at enqueue time
+    frame_kind          INTEGER NOT NULL,        -- FrameType code (0x01 message, 0x02 file metadata, etc.)
+    encrypted_blob      BLOB NOT NULL,           -- ratchet-encrypted bytes already framed-payload-ready
+    created_at          INTEGER NOT NULL,        -- ms since epoch
+    last_attempt_at     INTEGER,                 -- ms since epoch; NULL means not yet attempted
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    status              TEXT NOT NULL DEFAULT 'queued',  -- queued|delivered|expired|failed
+    FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_i2p_send_queue_status ON i2p_send_queue(status, last_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_i2p_send_queue_contact ON i2p_send_queue(contact_id, status);
 "#;
 
 pub fn apply(conn: &Connection) -> DbResult<()> {

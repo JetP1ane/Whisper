@@ -28,9 +28,13 @@ use ed25519_dalek::{
     Signature, Signer, SigningKey as EdSigningKey, Verifier, VerifyingKey as EdVerifyingKey,
 };
 
-/// Bundle version 2 adds `relay_url` so other clients know where to deposit
-/// messages destined for this owner (cross-relay messaging).
-pub const BUNDLE_VERSION: i32 = 2;
+/// Bundle version 2 added `relay_url` for cross-relay messaging.
+/// Bundle version 3 adds `i2p_destination` so peers can reach this owner
+/// over I2P directly without ever touching a relay. v3 keeps `relay_url`
+/// in the layout so older v2 readers (and the relay-fallback path)
+/// continue to deserialize. New installs leave `relay_url` empty when
+/// I2P is the only transport.
+pub const BUNDLE_VERSION: i32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKeyBundle {
@@ -43,9 +47,13 @@ pub struct PublicKeyBundle {
     pub bundle_signature: [u8; 64], // Ed25519 over the unsigned payload
     pub alias: String,
     pub display_name: Option<String>,
-    /// The owner's home relay URL. Recipients deposit messages for this
-    /// owner here. May be empty (e.g., transient/test bundles).
+    /// Owner's home relay URL (legacy v2 transport path). Empty for new
+    /// I2P-only installs.
     pub relay_url: String,
+    /// Owner's I2P destination (base64). Empty for legacy v1/v2 bundles
+    /// that predate the I2P transport. When non-empty, recipients
+    /// deliver via I2P directly through this destination.
+    pub i2p_destination: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +104,8 @@ pub fn serialize(b: &PublicKeyBundle) -> Vec<u8> {
         + 4 + b.bundle_signature.len()
         + 4 + b.alias.len()
         + 4 + b.display_name.as_ref().map(|s| s.len()).unwrap_or(0)
-        + 4 + b.relay_url.len();
+        + 4 + b.relay_url.len()
+        + 4 + b.i2p_destination.len();
     let mut out = Vec::with_capacity(cap);
     write_i32(&mut out, b.version);
     write_field(&mut out, &b.identity_key);
@@ -112,7 +121,8 @@ pub fn serialize(b: &PublicKeyBundle) -> Vec<u8> {
     write_field(&mut out, &b.bundle_signature);
     write_string(&mut out, Some(&b.alias));
     write_string(&mut out, b.display_name.as_deref());
-    write_field(&mut out, b.relay_url.as_bytes()); // v2: append at end
+    write_field(&mut out, b.relay_url.as_bytes()); // v2 trailing field
+    write_field(&mut out, b.i2p_destination.as_bytes()); // v3 trailing field
     out
 }
 
@@ -202,6 +212,14 @@ pub fn deserialize(bytes: &[u8]) -> CryptoResult<PublicKeyBundle> {
     } else {
         String::new()
     };
+    // v3: i2p_destination. v1/v2 bundles don't have it; tolerate by reading empty.
+    let i2p_destination = if c.off < c.data.len() {
+        std::str::from_utf8(c.read_field()?)
+            .map_err(|_| CryptoError::Decode("bundle i2p_destination not UTF-8"))?
+            .to_string()
+    } else {
+        String::new()
+    };
 
     Ok(PublicKeyBundle {
         version,
@@ -223,6 +241,7 @@ pub fn deserialize(bytes: &[u8]) -> CryptoResult<PublicKeyBundle> {
         alias,
         display_name,
         relay_url,
+        i2p_destination,
     })
 }
 
@@ -241,6 +260,7 @@ pub fn build_signed_bundle(
     alias: String,
     display_name: Option<String>,
     relay_url: String,
+    i2p_destination: String,
 ) -> PublicKeyBundle {
     let mut placeholder = PublicKeyBundle {
         version: BUNDLE_VERSION,
@@ -253,6 +273,7 @@ pub fn build_signed_bundle(
         alias,
         display_name,
         relay_url,
+        i2p_destination,
     };
     let payload = serialize(&placeholder);
     let sig = signing.sign(&payload).to_bytes();
@@ -475,6 +496,7 @@ mod tests {
             alias,
             Some("test".into()),
             "wss://test.example.com/ws".into(),
+            "I2P_DEST_TEST_PLACEHOLDER".into(),
         )
     }
 
@@ -536,6 +558,7 @@ mod tests {
             bob_alias.clone(),
             None,
             "wss://eve.example.com/ws".into(),
+            "I2P_DEST_EVE".into(),
         );
         // Eve's signature on the bundle is valid (she signed it), but the
         // alias-vs-identity-key check rejects the substitution.

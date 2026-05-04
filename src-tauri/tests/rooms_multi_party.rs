@@ -126,6 +126,7 @@ fn build_published_bundle(
         derive_alias(&keys.ed25519_verifying().to_bytes()),
         None,
         "wss://test.example.com/ws".into(),
+        String::new(),
     )
 }
 

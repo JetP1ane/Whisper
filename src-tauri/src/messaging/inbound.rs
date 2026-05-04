@@ -255,6 +255,11 @@ async fn handle_contact_request(
         //       via `bootstrap_responder`.
         // Wiping unconditionally breaks (a) without helping (b).
 
+        let i2p_destination = if parsed.i2p_destination.is_empty() {
+            None
+        } else {
+            Some(parsed.i2p_destination.clone())
+        };
         let contact = Contact {
             id: contact_id.clone(),
             alias: alias.clone(),
@@ -262,6 +267,7 @@ async fn handle_contact_request(
             x25519_public: parsed.x25519_key.to_vec(),
             mlkem_public: parsed.kyber_key.clone(),
             relay_url: state.relay.current_url(),
+            i2p_destination,
             verified: false,
             peer_has_verified_us: false,
             hide_until_verified: false,
@@ -1624,6 +1630,11 @@ fn persist_room_peer_as_contact(
         .into_iter()
         .find(|c| c.ed25519_public.as_slice() == bundle.identity_key.as_slice());
 
+    let i2p_destination = if bundle.i2p_destination.is_empty() {
+        None
+    } else {
+        Some(bundle.i2p_destination.clone())
+    };
     let contact = match existing {
         Some(mut c) => {
             // Refresh the bundle-derived fields — the peer may have rotated
@@ -1632,6 +1643,10 @@ fn persist_room_peer_as_contact(
             c.x25519_public = bundle.x25519_key.to_vec();
             c.mlkem_public = bundle.kyber_key.clone();
             c.relay_url = relay_url;
+            // Refresh the I2P destination too — peers can rotate.
+            if i2p_destination.is_some() {
+                c.i2p_destination = i2p_destination.clone();
+            }
             c.updated_at = now;
             rt.db.upsert_contact(&c)?;
             c
@@ -1644,6 +1659,7 @@ fn persist_room_peer_as_contact(
                 x25519_public: bundle.x25519_key.to_vec(),
                 mlkem_public: bundle.kyber_key.clone(),
                 relay_url,
+                i2p_destination: i2p_destination.clone(),
                 verified: false,
                 peer_has_verified_us: false,
                 hide_until_verified: false,

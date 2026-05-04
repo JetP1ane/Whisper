@@ -221,6 +221,14 @@ pub fn build_published_bundle(db: &Database, id: &LoadedIdentity) -> anyhow::Res
         .ok()
         .flatten()
         .unwrap_or_default();
+    // I2P destination (v3 bundle field). Empty for users who haven't
+    // started the I2P transport yet — the v2 relay_url path keeps
+    // working until they do.
+    let i2p_destination = crate::transport::i2p::destination::load(db)
+        .ok()
+        .flatten()
+        .map(|d| d.pub_b64)
+        .unwrap_or_default();
     let bundle = build_signed_bundle(
         &id.keys.ed25519_signing,
         id.keys.ed25519_verifying().to_bytes(),
@@ -231,6 +239,7 @@ pub fn build_published_bundle(db: &Database, id: &LoadedIdentity) -> anyhow::Res
         id.alias.clone(),
         id.display_name.clone(),
         relay_url,
+        i2p_destination,
     );
     Ok(bundle)
 }

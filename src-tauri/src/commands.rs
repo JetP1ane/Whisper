@@ -578,6 +578,11 @@ fn persist_bundle_as_contact(
     } else {
         Some(bundle.relay_url.clone())
     };
+    let i2p_destination = if bundle.i2p_destination.is_empty() {
+        None
+    } else {
+        Some(bundle.i2p_destination.clone())
+    };
     let contact = Contact {
         id: Uuid::new_v4().to_string(),
         alias: bundle.alias.clone(),
@@ -585,6 +590,7 @@ fn persist_bundle_as_contact(
         x25519_public: bundle.x25519_key.to_vec(),
         mlkem_public: bundle.kyber_key.clone(),
         relay_url,
+        i2p_destination,
         verified: false,
         peer_has_verified_us: false,
         hide_until_verified: false,
