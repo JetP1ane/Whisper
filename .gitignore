@@ -3,6 +3,7 @@ dist/
 .DS_Store
 src-tauri/target/
 src-tauri/gen/
+src-tauri/i2pd-bundle/
 *.log
 .vscode/
 .idea/
