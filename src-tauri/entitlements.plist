@@ -2,12 +2,23 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- App Sandbox -->
+    <!-- App Sandbox.
+         DEV NOTE: temporarily disabled while we use the Homebrew i2pd
+         binary at /opt/homebrew/opt/i2pd/bin/i2pd. Sandbox forbids
+         spawning processes outside the container. Phase 2.5 will
+         bundle i2pd into Contents/Resources/ and codesign it, at which
+         point this flips back to <true/>. -->
     <key>com.apple.security.app-sandbox</key>
-    <true/>
+    <false/>
 
     <!-- Hardened Runtime: only what we need -->
     <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Allow inbound TCP listeners — we run the SAM bridge on a
+         randomized loopback port and i2pd itself binds for transit
+         routing (when opted in). -->
+    <key>com.apple.security.network.server</key>
     <true/>
 
     <!--
