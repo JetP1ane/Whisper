@@ -12,6 +12,7 @@ pub mod control_messages;
 pub mod cross_relay_stats;
 pub mod envelopes;
 pub mod frame_accounting;
+pub mod i2p;
 pub mod mailbox;
 pub mod relay;
 pub mod tls_pin;
