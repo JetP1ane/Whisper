@@ -98,6 +98,81 @@ fn persist_relay_pin_if_new(
     }
 }
 
+/// Try I2P delivery for a `PreparedSend`. Returns:
+///   * `Ok(true)` — delivered via I2P, caller should mark status `sent`
+///     and skip the relay path entirely.
+///   * `Ok(false)` — I2P not attempted (no runtime, no peer destination,
+///     or the peer destination looks invalid). Caller falls through to
+///     the relay code.
+///   * `Err(_)` — I2P was attempted and failed mid-flight (tunnel error,
+///     ACK mismatch, etc.). Caller falls through to relay so a single
+///     transient failure doesn't drop the message.
+///
+/// Centralizing this here keeps each `message_send*` command's I2P
+/// graft to a single 3-line decision: try I2P, on `Ok(true)` emit the
+/// status event + return, otherwise continue with the existing relay
+/// code unchanged.
+async fn try_i2p_deliver(
+    state: &std::sync::Arc<AppState>,
+    contact: &Contact,
+    kind: crate::transport::i2p::framing::FrameType,
+    blob: &[u8],
+) -> CmdResult<bool> {
+    let runtime = {
+        let slot = state.i2p.lock().await;
+        slot.as_ref().cloned()
+    };
+    let runtime = match runtime {
+        Some(r) => r,
+        None => return Ok(false),
+    };
+    if !crate::transport::i2p::dispatch::should_use_i2p(contact, Some(&runtime)) {
+        return Ok(false);
+    }
+    let dest = match contact.i2p_destination.as_deref() {
+        Some(d) => d,
+        None => return Ok(false),
+    };
+    let inner = crate::transport::i2p::dispatch::strip_mailbox_prefix(blob)
+        .map_err(err)?;
+    match runtime.connection.send_blob(dest, kind, inner).await {
+        Ok(()) => {
+            tracing::info!(
+                "i2p: delivered to {} via destination {}",
+                contact.alias,
+                &dest[..16.min(dest.len())]
+            );
+            Ok(true)
+        }
+        Err(e) => {
+            tracing::info!(
+                "i2p: send to {} failed ({e}); falling back to relay",
+                contact.alias
+            );
+            Ok(false)
+        }
+    }
+}
+
+/// Emit a `message:status` event for the given message id. Used by the
+/// I2P path (which has no persistent `Deposited` event from the relay
+/// to flip status downstream).
+fn emit_message_status_sent(app: &tauri::AppHandle, msg_id: &str) {
+    #[derive(Serialize, Clone)]
+    struct StatusEvt<'a> {
+        message_id: &'a str,
+        status: &'a str,
+    }
+    use tauri::Emitter;
+    let _ = app.emit(
+        "message:status",
+        StatusEvt {
+            message_id: msg_id,
+            status: "sent",
+        },
+    );
+}
+
 // =====================================================================
 // vault
 // =====================================================================
@@ -303,7 +378,11 @@ async fn setup_or_restore(
 }
 
 #[tauri::command]
-pub async fn vault_unlock(passphrase: String, state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<()> {
+pub async fn vault_unlock(
+    passphrase: String,
+    state: State<'_, std::sync::Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> CmdResult<()> {
     if state.is_unlocked() {
         return Ok(());
     }
@@ -358,7 +437,7 @@ pub async fn vault_unlock(passphrase: String, state: State<'_, std::sync::Arc<Ap
         .as_ref()
         .map(|rt| rt.dek.to_vec())
         .ok_or("vault locked between unlock and i2p spawn")?;
-    spawn_i2p_start(std::sync::Arc::clone(&state), dek_clone);
+    spawn_i2p_start(std::sync::Arc::clone(&state), app.clone(), dek_clone);
 
     Ok(())
 }
@@ -367,7 +446,11 @@ pub async fn vault_unlock(passphrase: String, state: State<'_, std::sync::Arc<Ap
 /// opens its OWN Database handle (sharing the SQLCipher file via WAL)
 /// so it never needs to coordinate with the vault parking_lot Mutex
 /// for long-running async work. The handle survives until vault_lock.
-fn spawn_i2p_start(state: std::sync::Arc<AppState>, dek_bytes: Vec<u8>) {
+fn spawn_i2p_start(
+    state: std::sync::Arc<AppState>,
+    app: tauri::AppHandle,
+    dek_bytes: Vec<u8>,
+) {
     let db_path = state.paths.db_file.clone();
     tokio::spawn(async move {
         // Open a second DB connection for the I2P runtime. SQLCipher
@@ -404,17 +487,51 @@ fn spawn_i2p_start(state: std::sync::Arc<AppState>, dek_bytes: Vec<u8>) {
             .unwrap_or(false);
         let profile_dir = crate::profile::data_dir();
 
-        // Phase 6 inbound dispatcher: log only. Phase 6.5 will route
-        // frames into messaging::inbound::process_inbound_payload.
+        // Inbound dispatcher: feed every Message frame through the
+        // existing relay-style inbound pipeline by reconstructing a
+        // synthetic `[mailbox_prefix][body]` blob from the peer's I2P
+        // destination. FileMetadata frames go through the same path
+        // (they're attachment envelopes inside). FileChunk + ACK +
+        // keepalives are handled by the connection manager itself.
+        let app_handle = app.clone();
+        let state_for_dispatch = state.clone();
         let dispatcher: crate::transport::i2p::runtime::FrameDispatcher =
-            std::sync::Arc::new(|peer_dest, frame| {
+            std::sync::Arc::new(move |peer_dest, frame| {
+                let app = app_handle.clone();
+                let state = state_for_dispatch.clone();
                 Box::pin(async move {
-                    tracing::info!(
-                        "i2p: inbound frame {:?} ({} bytes) from {}",
-                        frame.kind,
-                        frame.payload.len(),
-                        &peer_dest[..16.min(peer_dest.len())]
-                    );
+                    use crate::transport::i2p::framing::FrameType;
+                    match frame.kind {
+                        FrameType::Message | FrameType::FileMetadata => {
+                            if let Err(e) = crate::messaging::inbound::dispatch_i2p_frame(
+                                &app,
+                                &state,
+                                &peer_dest,
+                                &frame.payload,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "i2p: inbound dispatch failed for {}: {e:#}",
+                                    &peer_dest[..16.min(peer_dest.len())]
+                                );
+                            }
+                        }
+                        FrameType::FileChunk => {
+                            // Phase 7 wires the streaming reassembly path.
+                            tracing::debug!(
+                                "i2p: FileChunk from {} (Phase 7 will handle)",
+                                &peer_dest[..16.min(peer_dest.len())]
+                            );
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "i2p: ignoring frame {:?} from {}",
+                                frame.kind,
+                                &peer_dest[..16.min(peer_dest.len())]
+                            );
+                        }
+                    }
                     Ok(())
                 })
             });
@@ -1274,8 +1391,10 @@ pub async fn message_send(
         .ok_or_else(|| format!("no bundle for {}", contact.alias))?;
 
     // Prepare the encrypted blob synchronously (DB writes), then deposit
-    // either via the home relay (fast path) or via a transient WebSocket to
-    // the contact's home relay (cross-relay).
+    // either via I2P (preferred when both peers have destinations + the
+    // local I2P runtime is up) or via the relay (fallback path that
+    // remains the backbone until the user's contacts have all upgraded
+    // to v3 bundles).
     let prepared = {
         let guard = state.vault.lock();
         let rt = guard.as_ref().ok_or("vault locked")?;
@@ -1291,6 +1410,23 @@ pub async fn message_send(
         )
         .map_err(err)?
     };
+
+    if try_i2p_deliver(
+        &state,
+        &contact,
+        crate::transport::i2p::framing::FrameType::Message,
+        &prepared.blob,
+    )
+    .await?
+    {
+        {
+            let guard = state.vault.lock();
+            let rt = guard.as_ref().ok_or("vault locked")?;
+            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+        }
+        emit_message_status_sent(&app, &prepared.msg_id);
+        return Ok(prepared.message.id);
+    }
 
     match prepared.target_relay_url.as_deref() {
         Some(target) => {
@@ -1319,19 +1455,7 @@ pub async fn message_send(
                 let rt = guard.as_ref().ok_or("vault locked")?;
                 let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
             }
-            #[derive(Serialize, Clone)]
-            struct StatusEvt<'a> {
-                message_id: &'a str,
-                status: &'a str,
-            }
-            use tauri::Emitter;
-            let _ = app.emit(
-                "message:status",
-                StatusEvt {
-                    message_id: &prepared.msg_id,
-                    status: "sent",
-                },
-            );
+            emit_message_status_sent(&app, &prepared.msg_id);
         }
         None => {
             // Same-relay fast path: ride the persistent home connection.
@@ -1415,8 +1539,27 @@ pub async fn message_send_detonating(
     };
 
     // Clamp relay TTL to the detonation window so the blob also disappears
-    // server-side. Cap at 24h since that's the relay's max retention.
+    // server-side. Cap at 24h since that's the relay's max retention. The
+    // I2P path doesn't need this — there's no server holding the blob;
+    // detonation is enforced by the AEAD-embedded TTL on both clients.
     let relay_ttl = (detonate_secs as u64).min(60 * 60 * 24);
+
+    if try_i2p_deliver(
+        &state,
+        &contact,
+        crate::transport::i2p::framing::FrameType::Message,
+        &prepared.blob,
+    )
+    .await?
+    {
+        {
+            let guard = state.vault.lock();
+            let rt = guard.as_ref().ok_or("vault locked")?;
+            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+        }
+        emit_message_status_sent(&app, &prepared.msg_id);
+        return Ok(prepared.message.id);
+    }
 
     match prepared.target_relay_url.as_deref() {
         Some(target) => {
@@ -1444,19 +1587,7 @@ pub async fn message_send_detonating(
                 let rt = guard.as_ref().ok_or("vault locked")?;
                 let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
             }
-            #[derive(Serialize, Clone)]
-            struct StatusEvt<'a> {
-                message_id: &'a str,
-                status: &'a str,
-            }
-            use tauri::Emitter;
-            let _ = app.emit(
-                "message:status",
-                StatusEvt {
-                    message_id: &prepared.msg_id,
-                    status: "sent",
-                },
-            );
+            emit_message_status_sent(&app, &prepared.msg_id);
         }
         None => {
             let _ = state.relay.deposit(
@@ -1581,7 +1712,7 @@ pub async fn room_create(
         }
 
         // 3. Per-invitee encrypted invite ready for deposit.
-        let mut wires: Vec<(Vec<u8>, String, Option<String>)> = Vec::new();
+        let mut wires: Vec<(Vec<u8>, String, Option<String>, Option<String>)> = Vec::new();
         for c in &invitees {
             let envelope = build_room_invite_envelope(
                 now as u64,
@@ -1627,15 +1758,49 @@ pub async fn room_create(
             let mut blob = Vec::with_capacity(32 + wire.len());
             blob.extend_from_slice(sender_mb_hex.as_bytes());
             blob.extend_from_slice(&wire);
-            wires.push((blob, recipient_mb_hex, c.relay_url.clone()));
+            wires.push((
+                blob,
+                recipient_mb_hex,
+                c.relay_url.clone(),
+                c.i2p_destination.clone(),
+            ));
         }
         wires
     };
 
-    // Async fan-out: deposit each invite either via the home WS or a
-    // transient connection to the invitee's relay.
+    // Async fan-out: deliver each invite either via I2P direct, the
+    // home WS, or a transient connection to the invitee's relay.
+    let i2p_runtime = {
+        let slot = state.i2p.lock().await;
+        slot.as_ref().cloned()
+    };
     let home = state.relay.current_url();
-    for (blob, recipient_mb_hex, target) in prepared {
+    for (blob, recipient_mb_hex, target, i2p_dest) in prepared {
+        let mut delivered = false;
+        if let (Some(rt), Some(dest)) = (i2p_runtime.as_ref(), i2p_dest.as_deref()) {
+            if dest.len() >= 400 {
+                if let Ok(inner) =
+                    crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob)
+                {
+                    if rt
+                        .connection
+                        .send_blob(
+                            dest,
+                            crate::transport::i2p::framing::FrameType::Message,
+                            inner,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        delivered = true;
+                    }
+                }
+            }
+        }
+        if delivered {
+            continue;
+        }
+
         let cross = match (target.as_deref(), home.as_deref()) {
             (Some(t), Some(h)) if !t.is_empty() && t != h => Some(t.to_string()),
             (Some(t), None) if !t.is_empty() => Some(t.to_string()),
@@ -1719,9 +1884,12 @@ pub async fn room_send(
         let wire = sender_key::pack_room_wire(&room_id_bytes, &me_pub, &enc);
 
         // Outbound fan-out targets: every other member with a known contact.
+        // We carry the per-member I2P destination through to the
+        // dispatch loop below so each recipient gets the same I2P-first
+        // / relay-fallback decision as direct messages.
         let members = rt.db.list_room_members(&room_id).map_err(err)?;
         let contacts = rt.db.list_contacts().map_err(err)?;
-        let mut targets: Vec<(String, Option<String>, [u8; 32])> = Vec::new();
+        let mut targets: Vec<(Option<String>, Option<String>, [u8; 32])> = Vec::new();
         for m in members {
             if m.contact_id == "self" {
                 continue;
@@ -1733,21 +1901,21 @@ pub async fn room_send(
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            targets.push((c.id.clone(), c.relay_url.clone(), pk));
+            targets.push((c.i2p_destination.clone(), c.relay_url.clone(), pk));
         }
 
         let me_mb_hex = crate::transport::mailbox::hex(
             &crate::transport::mailbox::current_mailbox(&me_pub),
         );
-        let mut blobs: Vec<(Vec<u8>, String, Option<String>)> = Vec::new();
-        for (_cid, target_relay, peer_pub) in targets {
+        let mut blobs: Vec<(Vec<u8>, String, Option<String>, Option<String>)> = Vec::new();
+        for (i2p_dest, target_relay, peer_pub) in targets {
             let recipient_mb_hex = crate::transport::mailbox::hex(
                 &crate::transport::mailbox::current_mailbox(&peer_pub),
             );
             let mut blob = Vec::with_capacity(32 + wire.len());
             blob.extend_from_slice(me_mb_hex.as_bytes());
             blob.extend_from_slice(&wire);
-            blobs.push((blob, recipient_mb_hex, target_relay));
+            blobs.push((blob, recipient_mb_hex, target_relay, i2p_dest));
         }
 
         // Persist the local sent row.
@@ -1786,8 +1954,40 @@ pub async fn room_send(
         blobs
     };
 
+    // Snapshot the I2P runtime once for the whole room fan-out.
+    let i2p_runtime = {
+        let slot = state.i2p.lock().await;
+        slot.as_ref().cloned()
+    };
+
     let home = state.relay.current_url();
-    for (blob, recipient_mb_hex, target) in prepared {
+    for (blob, recipient_mb_hex, target, i2p_dest) in prepared {
+        // I2P first per recipient.
+        let mut delivered = false;
+        if let (Some(rt), Some(dest)) = (i2p_runtime.as_ref(), i2p_dest.as_deref()) {
+            if dest.len() >= 400 {
+                if let Ok(inner) =
+                    crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob)
+                {
+                    if rt
+                        .connection
+                        .send_blob(
+                            dest,
+                            crate::transport::i2p::framing::FrameType::Message,
+                            inner,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        delivered = true;
+                    }
+                }
+            }
+        }
+        if delivered {
+            continue;
+        }
+
         let cross = match (target.as_deref(), home.as_deref()) {
             (Some(t), Some(h)) if !t.is_empty() && t != h => Some(t.to_string()),
             (Some(t), None) if !t.is_empty() => Some(t.to_string()),
@@ -1915,6 +2115,26 @@ pub async fn message_send_attachment(
         tracing::warn!("attachment_store (sender side) failed: {e}");
     }
 
+    // I2P attempt — note attachments use the FileMetadata frame type
+    // here (the inline-bytes shape that fits inside one frame).
+    // Phase 7 will add the streaming chunked path for larger files.
+    if try_i2p_deliver(
+        &state,
+        &contact,
+        crate::transport::i2p::framing::FrameType::FileMetadata,
+        &prepared.blob,
+    )
+    .await?
+    {
+        {
+            let guard = state.vault.lock();
+            let rt = guard.as_ref().ok_or("vault locked")?;
+            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+        }
+        emit_message_status_sent(&app, &prepared.msg_id);
+        return Ok(prepared.message.id);
+    }
+
     match prepared.target_relay_url.as_deref() {
         Some(target) => {
             let pin = lookup_relay_pin(&state, target);
@@ -1935,11 +2155,7 @@ pub async fn message_send_attachment(
                 let rt = guard.as_ref().ok_or("vault locked")?;
                 let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
             }
-            use tauri::Emitter;
-            let _ = app.emit(
-                "message:status",
-                serde_json::json!({ "message_id": &prepared.msg_id, "status": "sent" }),
-            );
+            emit_message_status_sent(&app, &prepared.msg_id);
         }
         None => {
             let _ = state.relay.deposit(

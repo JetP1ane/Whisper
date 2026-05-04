@@ -241,6 +241,30 @@ fn record_outcome(db: &Database, row: &QueuedSend, outcome: Attempt) {
     }
 }
 
+/// One pass of the queue worker, but the DB is held directly (not
+/// through an Option). Used by the I2PManager-backed worker that
+/// always has its DB present (no vault-lock state to track here).
+pub async fn process_once_with_manager(
+    db: &parking_lot::Mutex<Database>,
+    conn: &ConnectionManager,
+) -> I2pResult<usize> {
+    let now = now_unix_ms();
+    let due = {
+        let guard = db.lock();
+        take_due_rows(&guard, now)
+    };
+    let mut delivered = 0;
+    for row in due {
+        let outcome = try_send(conn, &row).await;
+        if matches!(outcome, Attempt::Delivered) {
+            delivered += 1;
+        }
+        let guard = db.lock();
+        record_outcome(&guard, &row, outcome);
+    }
+    Ok(delivered)
+}
+
 /// One pass of the queue worker — useful for tests that drive a single
 /// tick without spawning the long-running worker. Returns the number of
 /// rows that were marked delivered this pass.

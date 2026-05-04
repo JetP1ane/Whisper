@@ -152,6 +152,58 @@ fn me_pubkey(state: &AppState) -> Option<[u8; 32]> {
         .map(|rt| rt.identity.keys.ed25519_verifying().to_bytes())
 }
 
+/// Public entry point for I2P-delivered frames. The peer's identity is
+/// known from the SAM `STREAM ACCEPT` (the base64 destination of the
+/// connecting peer), so we resolve them by looking up
+/// `contacts.i2p_destination`. We synthesize the same `[32B mailbox][body]`
+/// blob the relay path uses and feed it through `handle_one` for free
+/// reuse of all the existing dispatch logic (contact requests, session
+/// init, room messages, etc.).
+pub async fn dispatch_i2p_frame(
+    app: &AppHandle,
+    state: &AppState,
+    peer_dest: &str,
+    payload: &[u8],
+) -> Result<()> {
+    let contact = {
+        let guard = state.vault.lock();
+        let rt = guard.as_ref().ok_or_else(|| anyhow!("vault locked"))?;
+        let contacts = rt.db.list_contacts()?;
+        contacts
+            .into_iter()
+            .find(|c| c.i2p_destination.as_deref() == Some(peer_dest))
+    };
+    let contact = match contact {
+        Some(c) => c,
+        None => {
+            // First contact via I2P: this could be a contact-request
+            // envelope (the body itself carries the bundle), so we still
+            // dispatch through handle_one with a placeholder mailbox.
+            // The bundle's identity_key + alias inside will create the
+            // contact row and stamp i2p_destination from the bundle.
+            tracing::info!(
+                "i2p: frame from unknown destination {} — dispatching as anonymous",
+                &peer_dest[..16.min(peer_dest.len())]
+            );
+            // Use an all-zeros mailbox prefix; handle_one ignores prefix
+            // when handling contact-request envelopes (since it routes
+            // by magic bytes in the body).
+            let mut blob = Vec::with_capacity(MAILBOX_PREFIX_LEN + payload.len());
+            blob.extend_from_slice(&[b'0'; MAILBOX_PREFIX_LEN]);
+            blob.extend_from_slice(payload);
+            return handle_one(app, state, &B64.encode(&blob)).await;
+        }
+    };
+    // Reconstruct the sender mailbox prefix from the contact's Ed25519
+    // identity. handle_one needs the prefix to be valid ASCII hex.
+    let mb = crate::transport::mailbox::current_mailbox(&contact.ed25519_public);
+    let mb_hex = crate::transport::mailbox::hex(&mb);
+    let mut blob = Vec::with_capacity(MAILBOX_PREFIX_LEN + payload.len());
+    blob.extend_from_slice(mb_hex.as_bytes());
+    blob.extend_from_slice(payload);
+    handle_one(app, state, &B64.encode(&blob)).await
+}
+
 /// Decode one base64 blob delivered by the relay and dispatch by shape:
 ///
 /// - Empty mailbox / decoy: ignore.

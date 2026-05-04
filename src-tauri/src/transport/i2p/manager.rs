@@ -320,6 +320,13 @@ impl I2PManager {
         &self.log_path
     }
 
+    /// Borrow the secondary DB Mutex. Used by the queue worker so it
+    /// can re-acquire the lock each tick without going through the
+    /// vault.
+    pub fn db_mutex(&self) -> &parking_lot::Mutex<Database> {
+        &self.db
+    }
+
     /// Graceful shutdown: drop the control socket (kills the session in
     /// i2pd) then SIGTERM the process. SIGKILL after 5s if it lingers.
     pub async fn shutdown(mut self) -> I2pResult<()> {

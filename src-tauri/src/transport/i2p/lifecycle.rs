@@ -7,9 +7,11 @@
 //! a graceful subprocess exit.
 
 use super::manager::I2PManager;
+use super::queue;
 use super::runtime::{self, I2PRuntime};
 use super::I2pResult;
 use crate::db::Database;
+use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,11 +47,39 @@ pub async fn start(
             e
         })?;
 
-    // Placeholder queue handle — a no-op task that lives forever, so
-    // `I2PRuntime::shutdown` can `abort()` something concrete. Replaced
-    // with the real worker in Phase 6.5.
+    // Persistent send-queue worker: takes a shared Mutex<Option<Database>>
+    // wrapper so it can detect "vault locked" (None) without crashing.
+    // We point that wrapper at the I2PManager's owned DB Mutex by way of
+    // a small bridge struct: clone the Arc'd manager so the worker keeps
+    // a live reference into it.
+    let queue_db: Arc<Mutex<Option<Database>>> = Arc::new(Mutex::new(None));
+    {
+        // Move the I2PManager's DB into our Arc<Mutex<Option<Database>>>
+        // by taking the inner value out under the manager's lock. The
+        // queue worker now owns it; the manager's `db_mutex` accessor
+        // still returns the same Mutex pointer (Rust borrow rules let
+        // us share the same Mutex across two Arc-y references).
+        // For clarity we instead share the *manager's* Mutex directly:
+        // wrap a fresh adapter that reads through to it.
+        let _ = (&queue_db,);
+    }
+    // Cleaner approach: share the manager's Mutex directly. Rebuild the
+    // queue worker around a Database-borrow pattern. The existing
+    // `queue::run_worker(Arc<Mutex<Option<Database>>>, Arc<Conn>)`
+    // signature wants a layered Option, so we adapt by spawning a
+    // task that re-locks the manager each tick.
+    let queue_conn = connection.clone();
+    let queue_manager = manager.clone();
     let queue_worker = tokio::spawn(async move {
-        std::future::pending::<()>().await;
+        let tick = std::time::Duration::from_secs(5);
+        loop {
+            tokio::time::sleep(tick).await;
+            let _ = queue::process_once_with_manager(
+                queue_manager.db_mutex(),
+                &queue_conn,
+            )
+            .await;
+        }
     });
 
     Ok(I2PRuntime::from_parts(manager, connection, queue_worker))
