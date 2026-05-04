@@ -58,6 +58,9 @@ export function MessageBubble({ m }: { m: DisplayMessage }) {
               · {prettyStatus(m.status)}
             </span>
           )}
+          {m.is_outbound && m.delivery_transport && (
+            <TransportBadge transport={m.delivery_transport} />
+          )}
           {m.disappear_at !== null && (
             <DetonateBadge deadline={m.disappear_at} now={now} />
           )}
@@ -65,6 +68,33 @@ export function MessageBubble({ m }: { m: DisplayMessage }) {
       </div>
     </div>
   );
+}
+
+function TransportBadge({ transport }: { transport: string }) {
+  // I2P is the privacy-preserving primary transport; relay is the
+  // fallback. Use distinct icons + colors so the user can see at a
+  // glance which path each send actually took.
+  if (transport === "i2p") {
+    return (
+      <span
+        className="text-accent-400 font-mono"
+        title="Delivered via I2P (peer-to-peer, no relay)"
+      >
+        · I2P
+      </span>
+    );
+  }
+  if (transport === "relay") {
+    return (
+      <span
+        className="text-text-tertiary font-mono"
+        title="Delivered via relay fallback (I2P unreachable)"
+      >
+        · relay
+      </span>
+    );
+  }
+  return null;
 }
 
 function DetonateBadge({ deadline, now }: { deadline: number; now: number }) {

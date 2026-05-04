@@ -146,6 +146,22 @@ impl Database {
         Ok(())
     }
 
+    /// Record which transport carried this outbound message — "i2p" or
+    /// "relay". Pre-Phase-6 rows have NULL here. The bubble UI renders
+    /// a small icon distinguishing the two so the user can see at a
+    /// glance which path each send actually took.
+    pub fn set_message_delivery_transport(
+        &self,
+        id: &str,
+        transport: &str,
+    ) -> DbResult<()> {
+        self.conn.execute(
+            "UPDATE messages SET delivery_transport = ?1 WHERE id = ?2",
+            params![transport, id],
+        )?;
+        Ok(())
+    }
+
     /// Insert a message row. Caller passes the TEE-encrypted body. For
     /// outbound messages, `wire_hash` is the SHA-256 of the deposited blob
     /// (so inbound delivery receipts can match it back).
@@ -279,7 +295,7 @@ impl Database {
             "SELECT id, sender_alias, is_outbound,
                     tee_encrypted_content, sealed_content,
                     is_attachment, filename, mime_type, file_size,
-                    status, disappear_at, created_at
+                    status, disappear_at, delivery_transport, created_at
              FROM messages
              WHERE conversation_id = ?1
              ORDER BY created_at ASC
@@ -299,7 +315,8 @@ impl Database {
                     file_size: r.get(8)?,
                     status: r.get(9)?,
                     disappear_at: r.get(10)?,
-                    created_at: r.get(11)?,
+                    delivery_transport: r.get(11)?,
+                    created_at: r.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -320,5 +337,7 @@ pub struct EncryptedRow {
     pub file_size: Option<i64>,
     pub status: String,
     pub disappear_at: Option<i64>,
+    /// "i2p" / "relay" / NULL — see `set_message_delivery_transport`.
+    pub delivery_transport: Option<String>,
     pub created_at: i64,
 }

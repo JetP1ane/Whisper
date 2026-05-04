@@ -40,6 +40,10 @@ export interface DisplayMessage {
    *  locally. Set when the sender opted in to a self-detonating envelope
    *  or when the conversation has a disappear timer. */
   disappear_at: number | null;
+  /** Which transport carried this outbound message — `"i2p"` or
+   *  `"relay"`. `null` for inbound rows or pre-Phase-6 sends. The
+   *  bubble renders a small icon distinguishing them. */
+  delivery_transport: string | null;
   created_at: number;
 }
 

@@ -205,6 +205,12 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
     let _ = conn.execute("ALTER TABLE identity ADD COLUMN i2p_dest_pub TEXT", []);
     let _ = conn.execute("ALTER TABLE identity ADD COLUMN i2p_dest_priv BLOB", []);
     let _ = conn.execute("ALTER TABLE contacts ADD COLUMN i2p_destination TEXT", []);
+    // delivery_transport on outbound message rows: "i2p" if the I2P
+    // dispatch path delivered, "relay" if the legacy relay fallback
+    // carried it, NULL for inbound rows or pre-migration messages.
+    // Surfaced in the chat bubble as a small icon so the user can see
+    // which transport actually moved each byte.
+    let _ = conn.execute("ALTER TABLE messages ADD COLUMN delivery_transport TEXT", []);
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?1)",
         [CURRENT_VERSION.to_string()],

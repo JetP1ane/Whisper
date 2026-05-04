@@ -179,6 +179,17 @@ async fn try_i2p_deliver(
     Ok(false)
 }
 
+/// Stamp a message row with its actual delivery transport. The vault
+/// guard is taken inside; callers don't need to be holding it. Safe
+/// to call before a deposit completes — the transport choice is known
+/// at dispatch time.
+fn stamp_transport(state: &std::sync::Arc<AppState>, msg_id: &str, transport: &str) {
+    let guard = state.vault.lock();
+    if let Some(rt) = guard.as_ref() {
+        let _ = rt.db.set_message_delivery_transport(msg_id, transport);
+    }
+}
+
 /// Emit a `message:status` event for the given message id. Used by the
 /// I2P path (which has no persistent `Deposited` event from the relay
 /// to flip status downstream).
@@ -1136,6 +1147,10 @@ pub struct DisplayMessage {
     /// (delete locally). Set when the sender opted in to a self-detonating
     /// envelope or when the conversation has a disappear timer.
     pub disappear_at: Option<i64>,
+    /// Which transport carried this outbound message — `"i2p"` or
+    /// `"relay"`. None for inbound rows or pre-Phase-6 sends. The
+    /// chat bubble renders a small icon distinguishing them.
+    pub delivery_transport: Option<String>,
     pub created_at: i64,
 }
 
@@ -1378,6 +1393,7 @@ pub async fn conversation_messages(
             file_size: r.file_size,
             status: r.status,
             disappear_at: r.disappear_at,
+            delivery_transport: r.delivery_transport,
             created_at: r.created_at,
         });
     }
@@ -1463,6 +1479,9 @@ pub async fn message_send(
             let guard = state.vault.lock();
             let rt = guard.as_ref().ok_or("vault locked")?;
             let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+            let _ = rt
+                .db
+                .set_message_delivery_transport(&prepared.msg_id, "i2p");
         }
         emit_message_status_sent(&app, &prepared.msg_id);
         return Ok(prepared.message.id);
@@ -1494,11 +1513,15 @@ pub async fn message_send(
                 let guard = state.vault.lock();
                 let rt = guard.as_ref().ok_or("vault locked")?;
                 let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+                let _ = rt
+                    .db
+                    .set_message_delivery_transport(&prepared.msg_id, "relay");
             }
             emit_message_status_sent(&app, &prepared.msg_id);
         }
         None => {
             // Same-relay fast path: ride the persistent home connection.
+            stamp_transport(&state, &prepared.msg_id, "relay");
             let _ = state.relay.deposit(
                 prepared.mailbox_hex.clone(),
                 &prepared.blob,
@@ -1596,6 +1619,9 @@ pub async fn message_send_detonating(
             let guard = state.vault.lock();
             let rt = guard.as_ref().ok_or("vault locked")?;
             let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+            let _ = rt
+                .db
+                .set_message_delivery_transport(&prepared.msg_id, "i2p");
         }
         emit_message_status_sent(&app, &prepared.msg_id);
         return Ok(prepared.message.id);
@@ -1626,10 +1652,14 @@ pub async fn message_send_detonating(
                 let guard = state.vault.lock();
                 let rt = guard.as_ref().ok_or("vault locked")?;
                 let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+                let _ = rt
+                    .db
+                    .set_message_delivery_transport(&prepared.msg_id, "relay");
             }
             emit_message_status_sent(&app, &prepared.msg_id);
         }
         None => {
+            stamp_transport(&state, &prepared.msg_id, "relay");
             let _ = state.relay.deposit(
                 prepared.mailbox_hex.clone(),
                 &prepared.blob,
@@ -2170,6 +2200,9 @@ pub async fn message_send_attachment(
             let guard = state.vault.lock();
             let rt = guard.as_ref().ok_or("vault locked")?;
             let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+            let _ = rt
+                .db
+                .set_message_delivery_transport(&prepared.msg_id, "i2p");
         }
         emit_message_status_sent(&app, &prepared.msg_id);
         return Ok(prepared.message.id);
@@ -2194,10 +2227,14 @@ pub async fn message_send_attachment(
                 let guard = state.vault.lock();
                 let rt = guard.as_ref().ok_or("vault locked")?;
                 let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+                let _ = rt
+                    .db
+                    .set_message_delivery_transport(&prepared.msg_id, "relay");
             }
             emit_message_status_sent(&app, &prepared.msg_id);
         }
         None => {
+            stamp_transport(&state, &prepared.msg_id, "relay");
             let _ = state.relay.deposit(
                 prepared.mailbox_hex.clone(),
                 &prepared.blob,
