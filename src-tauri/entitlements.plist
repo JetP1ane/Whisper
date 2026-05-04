@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- App Sandbox -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Hardened Runtime: only what we need -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!--
+        Keychain access. Under ad-hoc signing there is no team-ID prefix, so
+        we omit `keychain-access-groups` and let macOS use the default group
+        equal to the bundle identifier. For Mac App Store / Developer ID
+        builds, add:
+            <key>keychain-access-groups</key>
+            <array><string>$(AppIdentifierPrefix)com.noctisprivacy.whisper</string></array>
+    -->
+
+    <!-- Allow user-selected files for attachment picking -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+
+    <!-- Hardened runtime guards -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <false/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <false/>
+</dict>
+</plist>

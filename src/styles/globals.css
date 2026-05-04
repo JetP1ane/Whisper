@@ -1,0 +1,118 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+    --titlebar-h: 36px;
+
+    /* Dark palette (default). RGB channels (no commas) so Tailwind's
+       <alpha-value> mechanism can compose opacities. */
+    --bg-base: 0 0 0;
+    --bg-raised: 10 10 10;
+    --bg-inset: 5 5 5;
+    --bg-panel: 13 13 13;
+    --bg-hover: 20 20 20;
+    --bg-active: 26 26 26;
+
+    --border-subtle: 26 26 26;
+    --border-default: 38 38 38;
+    --border-strong: 64 64 64;
+
+    --text-primary: 245 245 245;
+    --text-secondary: 163 163 163;
+    --text-tertiary: 115 115 115;
+    --text-disabled: 82 82 82;
+  }
+
+  html.light {
+    color-scheme: light;
+
+    /* Light palette anchored on Noctis Whisper #E5E7EF. */
+    --bg-base: 229 231 239;
+    --bg-raised: 250 251 253;
+    --bg-inset: 220 223 229;
+    --bg-panel: 236 238 243;
+    --bg-hover: 221 224 232;
+    --bg-active: 210 213 221;
+
+    --border-subtle: 210 213 221;
+    --border-default: 192 196 205;
+    --border-strong: 154 160 171;
+
+    --text-primary: 20 23 31;
+    --text-secondary: 75 81 96;
+    --text-tertiary: 110 117 133;
+    --text-disabled: 154 160 171;
+  }
+
+  html, body, #root {
+    height: 100%;
+    background: rgb(var(--bg-base));
+  }
+
+  body {
+    font-feature-settings: "ss01", "cv11";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: rgb(16 185 129 / 0.25);
+    color: #fff;
+  }
+
+  /* Scrollbars: minimal, dark */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #1a1a1a;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #262626; background-clip: padding-box; }
+}
+
+@layer components {
+  .titlebar {
+    height: var(--titlebar-h);
+    user-select: none;
+  }
+
+  .panel {
+    @apply bg-bg-panel border-border-subtle;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center px-3 py-1.5 rounded-md
+           text-sm font-medium transition-colors duration-150
+           focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-500/40;
+  }
+  .btn-primary {
+    @apply btn bg-accent-500 text-black hover:bg-accent-400 active:bg-accent-600;
+  }
+  .btn-secondary {
+    @apply btn bg-bg-raised text-text-primary border border-border-default
+           hover:bg-bg-hover hover:border-border-strong;
+  }
+  .btn-ghost {
+    @apply btn text-text-secondary hover:text-text-primary hover:bg-bg-hover;
+  }
+
+  .input {
+    @apply w-full px-3 py-2 rounded-md
+           bg-bg-inset border border-border-default
+           text-text-primary placeholder:text-text-tertiary
+           focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500/30
+           transition-colors duration-150;
+  }
+
+  .kbd {
+    @apply inline-flex items-center justify-center
+           min-w-[18px] h-[18px] px-1 rounded
+           bg-bg-raised border border-border-default
+           text-[10px] font-mono text-text-tertiary;
+  }
+}

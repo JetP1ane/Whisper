@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Noctis Whisper",
+  "version": "0.1.0",
+  "identifier": "com.noctisprivacy.whisper",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "withGlobalTauri": false,
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: https://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost wss: ws:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Noctis Whisper",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "decorations": true,
+        "transparent": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true,
+        "fullscreen": false,
+        "backgroundColor": "#000000"
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "category": "SocialNetworking",
+    "shortDescription": "Private post-quantum messenger",
+    "longDescription": "Noctis Whisper is a privacy-focused desktop messenger with hybrid post-quantum end-to-end encryption, Secure Enclave key protection, and a zero-knowledge relay architecture.",
+    "macOS": {
+      "frameworks": [],
+      "minimumSystemVersion": "12.0",
+      "exceptionDomain": "",
+      "signingIdentity": "-",
+      "providerShortName": null,
+      "entitlements": "entitlements.plist"
+    }
+  },
+  "plugins": {}
+}

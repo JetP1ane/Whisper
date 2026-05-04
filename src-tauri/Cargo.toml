@@ -1,0 +1,87 @@
+[package]
+name = "noctis-whisper-desktop"
+version = "0.1.0-alpha"
+description = "Noctis Whisper — private, post-quantum desktop messenger"
+authors = ["Noctis Privacy"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "noctis_whisper_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# --- Tauri ---
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+
+# --- async + serialization ---
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+once_cell = "1"
+parking_lot = "0.12"
+hex = "0.4"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+bincode = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- crypto: classical ---
+rand = "0.8"
+rand_core = "0.6"
+x25519-dalek = { version = "2", features = ["serde", "static_secrets"] }
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+blake2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac", "sha2"] }
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+
+# --- crypto: post-quantum ---
+# pqcrypto-mlkem provides FIPS 203 ML-KEM-1024
+pqcrypto-mlkem = "0.1"
+pqcrypto-traits = "0.3"
+
+# --- websocket transport ---
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# --- TLS pinning ---
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots = "0.26"
+x509-parser = "0.16"
+
+# --- database ---
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
+
+# --- macOS Secure Enclave / Keychain ---
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+security-framework-sys = "2"
+core-foundation = "0.10"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
