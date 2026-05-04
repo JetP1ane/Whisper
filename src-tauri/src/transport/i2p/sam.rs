@@ -222,7 +222,15 @@ pub fn default_session_options() -> Vec<(&'static str, &'static str)> {
         ("outbound.length", "2"),
         ("inbound.quantity", "3"),
         ("outbound.quantity", "3"),
-        ("i2cp.leaseSetType", "5"),
+        // LS2 with ECIES-X25519-AEAD on-wire crypto (recommended). We
+        // omit `leaseSetType=5` (encrypted leaseset to a specific
+        // audience) for now because that requires per-client DH auth
+        // (`leaseSetAuthType=2`) plumbing that we don't yet have. With
+        // type=3 (LS2) any peer who knows the destination can resolve
+        // the leaseset and dial — same security envelope as before
+        // (destinations are only ever shared via signed bundles, never
+        // a public directory). See Mod #2 followup.
+        ("i2cp.leaseSetType", "3"),
         ("i2cp.leaseSetEncType", "4"),
     ]
 }
@@ -502,10 +510,13 @@ mod tests {
     }
 
     #[test]
-    fn default_session_options_includes_encrypted_leaseset() {
+    fn default_session_options_use_ls2_with_ecies() {
         let opts = default_session_options();
         let m: std::collections::HashMap<_, _> = opts.into_iter().collect();
-        assert_eq!(m.get("i2cp.leaseSetType"), Some(&"5"));
+        // LS2 (type 3) with ECIES-X25519-AEAD on-wire encryption.
+        // Encrypted leasesets (type 5) are deferred until per-client
+        // auth is wired.
+        assert_eq!(m.get("i2cp.leaseSetType"), Some(&"3"));
         assert_eq!(m.get("i2cp.leaseSetEncType"), Some(&"4"));
         assert_eq!(m.get("SIGNATURE_TYPE"), Some(&"7"));
     }
