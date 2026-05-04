@@ -1,13 +1,12 @@
 import { useState } from "react";
 import { SecurityDashboard } from "./SecurityDashboard";
-import { RelayConfig } from "./RelayConfig";
 import { NotificationsConfig } from "./NotificationsConfig";
 
 interface Props {
   onClose: () => void;
 }
 
-type Section = "security" | "relay" | "notifications";
+type Section = "security" | "notifications";
 
 export function Settings({ onClose }: Props) {
   const [section, setSection] = useState<Section>("security");
@@ -20,11 +19,6 @@ export function Settings({ onClose }: Props) {
             label="Security"
             active={section === "security"}
             onClick={() => setSection("security")}
-          />
-          <NavItem
-            label="Relay"
-            active={section === "relay"}
-            onClick={() => setSection("relay")}
           />
           <NavItem
             label="Notifications"
@@ -41,7 +35,6 @@ export function Settings({ onClose }: Props) {
           </header>
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
             {section === "security" && <SecurityDashboard />}
-            {section === "relay" && <RelayConfig />}
             {section === "notifications" && <NotificationsConfig />}
           </div>
         </div>

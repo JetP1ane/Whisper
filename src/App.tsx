@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { vaultLock, connectRelay, publishBundle } from "./hooks/useCrypto";
+import { vaultLock, publishBundle } from "./hooks/useCrypto";
 import { TitleBar } from "./components/layout/TitleBar";
 import { Sidebar } from "./components/layout/Sidebar";
 import { ChatView } from "./components/layout/ChatView";
@@ -14,8 +14,6 @@ import { Settings } from "./components/settings/Settings";
 import { useKeyboard } from "./hooks/useKeyboard";
 import { useAppStore } from "./stores/appStore";
 import { useConversationStore } from "./stores/conversationStore";
-
-const DEFAULT_RELAY = "ws://127.0.0.1:8080/ws";
 
 interface MessageReceivedPayload {
   conversation_id: string;
@@ -43,18 +41,17 @@ export default function App() {
     })();
   }, [refreshStatus]);
 
-  // Auto-connect to the dev relay once we're in a usable phase, then publish
-  // our public bundle so other peers can resolve our alias.
+  // Publish our bundle once we're in a usable phase. With the I2P
+  // transport this is purely informational on the local DB — peers
+  // discover us via QR/whisper:// link, not a relay-side directory.
   useEffect(() => {
     if (phase !== "ready" && phase !== "alias_reveal") return;
     let cancelled = false;
     (async () => {
       try {
-        await connectRelay(DEFAULT_RELAY);
-        if (cancelled) return;
         await publishBundle();
       } catch (e) {
-        console.warn("relay setup failed:", e);
+        if (!cancelled) console.warn("publishBundle failed:", e);
       }
     })();
     return () => {

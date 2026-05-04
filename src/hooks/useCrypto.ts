@@ -67,7 +67,7 @@ export interface Contact {
   ed25519_public: number[];
   x25519_public: number[];
   mlkem_public: number[];
-  relay_url: string | null;
+  i2p_destination: string | null;
   verified: boolean;
   peer_has_verified_us: boolean;
   hide_until_verified: boolean;
@@ -103,10 +103,3 @@ export async function setContactVerified(
   await invoke("contact_verify", { id: contactId, verified });
 }
 
-export async function setRelayUrl(url: string): Promise<void> {
-  await invoke("relay_set_url", { url });
-}
-
-export async function connectRelay(url: string): Promise<void> {
-  await invoke("relay_connect", { url });
-}

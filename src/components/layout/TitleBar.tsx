@@ -10,17 +10,9 @@ interface TitleBarProps {
 
 export function TitleBar({ onOpenSettings, onLock }: TitleBarProps = {}) {
   const vault = useAppStore((s) => s.vault);
-  const refreshRelay = useAppStore((s) => s.refreshRelay);
-  const relay = useAppStore((s) => s.relay);
   const [tier, setTier] = useState<string>("");
   const [tierRaw, setTierRaw] = useState<string>("");
   const { theme, toggle } = useTheme();
-
-  useEffect(() => {
-    refreshRelay();
-    const t = setInterval(refreshRelay, 10_000);
-    return () => clearInterval(t);
-  }, [refreshRelay]);
 
   useEffect(() => {
     if (vault?.hardware_tier) {
@@ -52,7 +44,6 @@ export function TitleBar({ onOpenSettings, onLock }: TitleBarProps = {}) {
           tier={tier}
           tierRaw={tierRaw}
           unlocked={!!vault?.unlocked}
-          relayConnected={!!relay?.connected}
         />
         <button
           onClick={toggle}
@@ -91,12 +82,10 @@ function SecurityShield({
   tier,
   tierRaw,
   unlocked,
-  relayConnected,
 }: {
   tier: string;
   tierRaw: string;
   unlocked: boolean;
-  relayConnected: boolean;
 }) {
   const [open, setOpen] = useState(false);
   // Wrap a click-outside handler around the popover.
@@ -113,7 +102,7 @@ function SecurityShield({
   const protectedByEnclave =
     tierRaw === "secure_enclave" || tierRaw === "secure_enclave_biometric";
   const biometric = tierRaw === "secure_enclave_biometric";
-  const healthy = unlocked && relayConnected && protectedByEnclave;
+  const healthy = unlocked && protectedByEnclave;
   const shieldColor = healthy
     ? "text-status-ok"
     : protectedByEnclave
@@ -167,7 +156,7 @@ function SecurityShield({
           <ul className="mt-1 space-y-0.5 text-[11px] text-text-secondary">
             <li>• Your long-term identity keys (Ed25519 + X25519 + ML-KEM)</li>
             <li>• Vault encryption key (DEK) sealing the SQLCipher database</li>
-            <li>• Configuration manifest signer (relay-tampering detector)</li>
+            <li>• I2P destination signing key + leaseset auth keys</li>
             <li>• Per-conversation TEE keys protecting message bodies at rest</li>
             <li>• Room sender-key chain seeds</li>
           </ul>
