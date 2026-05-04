@@ -135,23 +135,48 @@ async fn try_i2p_deliver(
     };
     let inner = crate::transport::i2p::dispatch::strip_mailbox_prefix(blob)
         .map_err(err)?;
-    match runtime.connection.send_blob(dest, kind, inner).await {
-        Ok(()) => {
-            tracing::info!(
-                "i2p: delivered to {} via destination {}",
-                contact.alias,
-                &dest[..16.min(dest.len())]
-            );
-            Ok(true)
+
+    // First-dial transient failures are common on I2P: leasesets need
+    // time to propagate to floodfills, NetDB lookups can miss the first
+    // time, tunnels sometimes get reset mid-handshake. Retry up to 3
+    // times with progressive backoff before falling back to the relay.
+    // The total worst-case delay (~7 s) is bounded by what the user
+    // can tolerate before the message visibly stalls; relay fallback
+    // after that point keeps the UX responsive.
+    let backoffs = [0u64, 3, 5];
+    let mut last_err: Option<String> = None;
+    for (i, secs) in backoffs.iter().enumerate() {
+        if *secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(*secs)).await;
         }
-        Err(e) => {
-            tracing::info!(
-                "i2p: send to {} failed ({e}); falling back to relay",
-                contact.alias
-            );
-            Ok(false)
+        match runtime.connection.send_blob(dest, kind, inner).await {
+            Ok(()) => {
+                tracing::info!(
+                    "i2p: delivered to {} via destination {} (attempt {})",
+                    contact.alias,
+                    &dest[..16.min(dest.len())],
+                    i + 1
+                );
+                return Ok(true);
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                tracing::debug!(
+                    "i2p: attempt {} to {} failed: {msg}",
+                    i + 1,
+                    contact.alias
+                );
+                last_err = Some(msg);
+            }
         }
     }
+    tracing::info!(
+        "i2p: send to {} failed after {} attempts ({}); falling back to relay",
+        contact.alias,
+        backoffs.len(),
+        last_err.as_deref().unwrap_or("unknown")
+    );
+    Ok(false)
 }
 
 /// Emit a `message:status` event for the given message id. Used by the
