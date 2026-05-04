@@ -41,7 +41,7 @@ fn now_unix_ms() -> i64 {
 /// either the URL is plaintext (`ws://`) or we have not yet performed a
 /// TOFU handshake with this relay.
 fn lookup_relay_pin(
-    state: &tauri::State<'_, std::sync::Arc<AppState>>,
+    state: &std::sync::Arc<AppState>,
     relay_url: &str,
 ) -> Option<[u8; 32]> {
     let guard = state.vault.lock();
@@ -59,7 +59,7 @@ fn lookup_relay_pin(
 /// UI can show users which relays they've actually been hitting and
 /// whether any of those calls failed.
 fn record_transient_deposit(
-    state: &tauri::State<'_, std::sync::Arc<AppState>>,
+    state: &std::sync::Arc<AppState>,
     relay_url: &str,
     result: &crate::transport::TransportResult<Option<[u8; 32]>>,
 ) {
@@ -75,7 +75,7 @@ fn record_transient_deposit(
 /// before this call. Mismatch cases never reach this path because the
 /// rustls verifier rejects the handshake before we observe a captured pin.
 fn persist_relay_pin_if_new(
-    state: &tauri::State<'_, std::sync::Arc<AppState>>,
+    state: &std::sync::Arc<AppState>,
     relay_url: &str,
     expected_pin: Option<[u8; 32]>,
     captured_pin: Option<[u8; 32]>,
@@ -1477,40 +1477,97 @@ pub async fn message_send(
         .map_err(err)?
     };
 
-    if try_i2p_deliver(
+    // Spawn dispatch in the background so the command returns immediately.
+    // The message row is already inserted (in `queued` status) by
+    // `prepare_send_text` above, so the frontend can render the bubble
+    // right away. As I2P / relay attempts resolve, we emit
+    // `message:status` events that flip the bubble's status indicator.
+    let state_clone = std::sync::Arc::clone(&state);
+    let app_clone = app.clone();
+    let contact_clone = contact.clone();
+    let prepared_for_task = PreparedDispatch {
+        msg_id: prepared.msg_id.clone(),
+        mailbox_hex: prepared.mailbox_hex.clone(),
+        blob: prepared.blob.clone(),
+        target_relay_url: prepared.target_relay_url.clone(),
+        relay_ttl: 60 * 60 * 24,
+        frame_kind: crate::transport::i2p::framing::FrameType::Message,
+    };
+    tokio::spawn(async move {
+        dispatch_outbound(state_clone, app_clone, contact_clone, prepared_for_task).await;
+    });
+
+    Ok(prepared.message.id)
+}
+
+/// Inputs the background dispatch task needs to attempt delivery via
+/// I2P first then relay. All fields are owned so the task doesn't
+/// borrow command state.
+struct PreparedDispatch {
+    msg_id: String,
+    mailbox_hex: String,
+    blob: Vec<u8>,
+    target_relay_url: Option<String>,
+    /// Relay deposit TTL in seconds. For regular text this is 24h; for
+    /// detonating messages it's clamped to the detonation window.
+    relay_ttl: u64,
+    /// Which I2P frame type to use. Text/control envelopes are
+    /// `Message`; attachments use `FileMetadata`.
+    frame_kind: crate::transport::i2p::framing::FrameType,
+}
+
+/// Background dispatch: try I2P first, fall back to relay (unless
+/// I2P-only mode is on, in which case mark the row failed and stop).
+/// Always returns; failures are logged + surface via `message:status`.
+async fn dispatch_outbound(
+    state: std::sync::Arc<AppState>,
+    app: tauri::AppHandle,
+    contact: Contact,
+    prepared: PreparedDispatch,
+) {
+    let attempted_i2p = match try_i2p_deliver(
         &state,
         &contact,
-        crate::transport::i2p::framing::FrameType::Message,
+        prepared.frame_kind,
         &prepared.blob,
     )
-    .await?
+    .await
     {
-        {
-            let guard = state.vault.lock();
-            let rt = guard.as_ref().ok_or("vault locked")?;
-            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
-            let _ = rt
-                .db
-                .set_message_delivery_transport(&prepared.msg_id, "i2p");
+        Ok(true) => {
+            {
+                let guard = state.vault.lock();
+                if let Some(rt) = guard.as_ref() {
+                    let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+                    let _ = rt
+                        .db
+                        .set_message_delivery_transport(&prepared.msg_id, "i2p");
+                }
+            }
+            emit_message_status_sent(&app, &prepared.msg_id);
+            return;
         }
-        emit_message_status_sent(&app, &prepared.msg_id);
-        return Ok(prepared.message.id);
-    }
+        Ok(false) => true,
+        Err(e) => {
+            tracing::warn!("dispatch_outbound: try_i2p_deliver errored: {e}");
+            true
+        }
+    };
 
-    // I2P-only mode: no relay fallback. Mark the row failed and bail
-    // so the user can see the I2P transport is genuinely the only path.
+    // I2P-only: no relay fallback. Mark failed.
     if is_i2p_only(&state) {
         let guard = state.vault.lock();
         if let Some(rt) = guard.as_ref() {
             let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
         }
-        return Err("i2p-only mode: I2P delivery failed and relay fallback is disabled".into());
+        emit_message_status(&app, &prepared.msg_id, "failed");
+        return;
     }
+    let _ = attempted_i2p;
 
     match prepared.target_relay_url.as_deref() {
         Some(target) => {
             tracing::info!(
-                "message_send: cross-relay deposit to {} for {}",
+                "dispatch_outbound: cross-relay deposit to {} for {}",
                 target,
                 contact.alias
             );
@@ -1519,25 +1576,38 @@ pub async fn message_send(
                 target,
                 &prepared.mailbox_hex,
                 &prepared.blob,
-                60 * 60 * 24,
+                prepared.relay_ttl,
                 std::time::Duration::from_secs(10),
                 pin,
             )
             .await;
             record_transient_deposit(&state, target, &result);
-            let captured = result.map_err(err)?;
-            persist_relay_pin_if_new(&state, target, pin, captured);
-            // Cross-relay deposits have no persistent home `Deposited`
-            // event, so flip status to `sent` directly here.
-            {
-                let guard = state.vault.lock();
-                let rt = guard.as_ref().ok_or("vault locked")?;
-                let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
-                let _ = rt
-                    .db
-                    .set_message_delivery_transport(&prepared.msg_id, "relay");
+            match result {
+                Ok(captured) => {
+                    persist_relay_pin_if_new(&state, target, pin, captured);
+                    {
+                        let guard = state.vault.lock();
+                        if let Some(rt) = guard.as_ref() {
+                            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
+                            let _ = rt.db.set_message_delivery_transport(
+                                &prepared.msg_id,
+                                "relay",
+                            );
+                        }
+                    }
+                    emit_message_status_sent(&app, &prepared.msg_id);
+                }
+                Err(e) => {
+                    tracing::warn!("dispatch_outbound: cross-relay deposit failed: {e}");
+                    {
+                        let guard = state.vault.lock();
+                        if let Some(rt) = guard.as_ref() {
+                            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
+                        }
+                    }
+                    emit_message_status(&app, &prepared.msg_id, "failed");
+                }
             }
-            emit_message_status_sent(&app, &prepared.msg_id);
         }
         None => {
             // Same-relay fast path: ride the persistent home connection.
@@ -1545,13 +1615,30 @@ pub async fn message_send(
             let _ = state.relay.deposit(
                 prepared.mailbox_hex.clone(),
                 &prepared.blob,
-                60 * 60 * 24,
+                prepared.relay_ttl,
                 prepared.msg_id.clone(),
             );
         }
     }
+}
 
-    Ok(prepared.message.id)
+/// Generic message:status emitter — the I2P-success path uses
+/// `emit_message_status_sent` for the common "sent" case; this
+/// is for "failed" or other terminal states.
+fn emit_message_status(app: &tauri::AppHandle, msg_id: &str, status: &str) {
+    #[derive(Serialize, Clone)]
+    struct StatusEvt<'a> {
+        message_id: &'a str,
+        status: &'a str,
+    }
+    use tauri::Emitter;
+    let _ = app.emit(
+        "message:status",
+        StatusEvt {
+            message_id: msg_id,
+            status,
+        },
+    );
 }
 
 /// Self-detonating text variant of `message_send`. The TTL is sealed
