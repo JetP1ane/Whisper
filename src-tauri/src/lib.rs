@@ -57,15 +57,10 @@ pub fn run() {
             commands::room_send,
             commands::attachment_load_data_url,
             commands::attachment_save_as,
-            // relay
-            commands::relay_status,
+            // transport (I2P)
             commands::i2p_status,
             commands::i2p_get_transit_optin,
             commands::i2p_set_transit_optin,
-            commands::relay_set_url,
-            commands::relay_connect,
-            commands::relay_change_url,
-            commands::cross_relay_stats,
             commands::messages_search,
             commands::notifications_get,
             commands::notifications_set,

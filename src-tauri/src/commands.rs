@@ -37,67 +37,6 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Look up the stored TLS SPKI pin for a given relay URL. `None` means
-/// either the URL is plaintext (`ws://`) or we have not yet performed a
-/// TOFU handshake with this relay.
-fn lookup_relay_pin(
-    state: &std::sync::Arc<AppState>,
-    relay_url: &str,
-) -> Option<[u8; 32]> {
-    let guard = state.vault.lock();
-    let rt = guard.as_ref()?;
-    let hex_str = rt
-        .db
-        .settings_get(&crate::transport::relay::pin_settings_key(relay_url))
-        .ok()
-        .flatten()?;
-    let bytes = hex::decode(hex_str).ok()?;
-    bytes.try_into().ok()
-}
-
-/// Record the outcome of a transient deposit into per-relay stats so the
-/// UI can show users which relays they've actually been hitting and
-/// whether any of those calls failed.
-fn record_transient_deposit(
-    state: &std::sync::Arc<AppState>,
-    relay_url: &str,
-    result: &crate::transport::TransportResult<Option<[u8; 32]>>,
-) {
-    use crate::transport::cross_relay_stats::{classify_transport_error, RelayCallStatus};
-    let status = match result {
-        Ok(_) => RelayCallStatus::Ok,
-        Err(e) => classify_transport_error(e),
-    };
-    state.cross_relay.record_deposit(relay_url, status);
-}
-
-/// Persist the captured pin for a relay URL only when no pin was stored
-/// before this call. Mismatch cases never reach this path because the
-/// rustls verifier rejects the handshake before we observe a captured pin.
-fn persist_relay_pin_if_new(
-    state: &std::sync::Arc<AppState>,
-    relay_url: &str,
-    expected_pin: Option<[u8; 32]>,
-    captured_pin: Option<[u8; 32]>,
-) {
-    if expected_pin.is_some() {
-        return;
-    }
-    let Some(pin) = captured_pin else { return };
-    let guard = state.vault.lock();
-    if let Some(rt) = guard.as_ref() {
-        let _ = rt.db.settings_put(
-            &crate::transport::relay::pin_settings_key(relay_url),
-            &hex::encode(pin),
-        );
-        tracing::info!(
-            "TOFU pin captured for transient relay {}: {}…",
-            relay_url,
-            &hex::encode(pin)[..16]
-        );
-    }
-}
-
 /// Try I2P delivery for a `PreparedSend`. Returns:
 ///   * `Ok(true)` — delivered via I2P, caller should mark status `sent`
 ///     and skip the relay path entirely.
@@ -689,38 +628,21 @@ pub async fn identity_invite_link(state: State<'_, std::sync::Arc<AppState>>) ->
     Ok(bundle::build_whisper_link(&bundle))
 }
 
+/// Local-only bundle build — pre-relay-removal this PUT to the relay's
+/// /bundle/{alias} endpoint so other peers could resolve us by alias.
+/// With I2P-only transport there is no directory, so the call now just
+/// rebuilds the bundle to validate it (and emits a log line for parity
+/// with the old flow). The bundle itself travels via QR/whisper:// link
+/// at contact-add time.
 #[tauri::command]
 pub async fn identity_publish_bundle(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<()> {
-    let (alias, bytes, relay_url) = {
+    let alias = {
         let guard = state.vault.lock();
-        let rt = guard.as_ref().ok_or_else(|| {
-            tracing::warn!("publish_bundle: vault locked");
-            "vault locked".to_string()
-        })?;
-        let bundle = identity::build_published_bundle(&rt.db, &rt.identity).map_err(|e| {
-            tracing::error!("publish_bundle: build_published_bundle failed: {e}");
-            err(e)
-        })?;
-        let alias = rt.identity.alias.clone();
-        let url = state.relay.current_url().ok_or_else(|| {
-            tracing::warn!("publish_bundle: no relay configured");
-            "no relay configured".to_string()
-        })?;
-        (alias, bundle::serialize(&bundle), url)
+        let rt = guard.as_ref().ok_or_else(|| "vault locked".to_string())?;
+        let _ = identity::build_published_bundle(&rt.db, &rt.identity).map_err(err)?;
+        rt.identity.alias.clone()
     };
-    tracing::info!(
-        "publish_bundle: PUT {} bytes to relay {} for alias `{}`",
-        bytes.len(),
-        relay_url,
-        alias
-    );
-    bundle_registry::put_bundle(&relay_url, &alias, &bytes)
-        .await
-        .map_err(|e| {
-            tracing::error!("publish_bundle: PUT failed: {e}");
-            err(e)
-        })?;
-    tracing::info!("publish_bundle: success for `{}`", alias);
+    tracing::info!("publish_bundle: ok for `{}` (local only)", alias);
     Ok(())
 }
 
@@ -735,30 +657,18 @@ pub async fn contact_list(state: State<'_, std::sync::Arc<AppState>>) -> CmdResu
     rt.db.list_contacts().map_err(err)
 }
 
+/// Alias-based contact add was a relay-directory lookup; with I2P-only
+/// transport there is no directory. Returns an explicit error so the
+/// frontend can surface "use a whisper:// link or QR" guidance.
 #[tauri::command]
 pub async fn contact_add_by_alias(
     alias: String,
-    nickname: Option<String>,
-    state: State<'_, std::sync::Arc<AppState>>,
+    _nickname: Option<String>,
+    _state: State<'_, std::sync::Arc<AppState>>,
 ) -> CmdResult<Contact> {
-    let relay_url = state.relay.current_url().ok_or("no relay configured")?;
-    let bundle = bundle_registry::get_bundle(&relay_url, &alias)
-        .await
-        .map_err(err)?
-        .ok_or_else(|| format!("no bundle for alias `{alias}`"))?;
-    let mut contact = persist_bundle_as_contact(&state, bundle, Some(relay_url))?;
-    if let Some(n) = nickname.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        {
-            let guard = state.vault.lock();
-            let rt = guard.as_ref().ok_or("vault locked")?;
-            rt.db.set_contact_nickname(&contact.id, Some(n)).map_err(err)?;
-        }
-        contact.nickname = Some(n.to_string());
-    }
-    if let Err(e) = announce_to_new_contact(&state, &contact).await {
-        tracing::warn!("contact-request announce failed: {e:#}");
-    }
-    Ok(contact)
+    Err(format!(
+        "alias lookup is unavailable in I2P-only mode — ask `{alias}` for a whisper:// link or QR"
+    ))
 }
 
 #[tauri::command]
@@ -768,7 +678,7 @@ pub async fn contact_add_by_link(
     state: State<'_, std::sync::Arc<AppState>>,
 ) -> CmdResult<Contact> {
     let bundle = bundle::parse_whisper_link(&link).map_err(err)?;
-    let mut contact = persist_bundle_as_contact(&state, bundle, state.relay.current_url())?;
+    let mut contact = persist_bundle_as_contact(&state, bundle, None)?;
     if let Some(n) = nickname.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         {
             let guard = state.vault.lock();
@@ -783,74 +693,60 @@ pub async fn contact_add_by_link(
     Ok(contact)
 }
 
-/// Deposit a contact-request envelope (`[0xCF,0xC0,0xDE,0x01] || my_bundle`)
-/// on the new contact's mailbox, prefixed with our sender mailbox so they
-/// can identify it. Routes to the contact's home relay when it differs from
-/// our own (cross-relay messaging). Best-effort — failures are logged.
+/// Send a contact-request envelope (`[0xCF,0xC0,0xDE,0x01] || my_bundle`)
+/// to the new contact via I2P. The peer's `dispatch_i2p_frame` recognizes
+/// the magic prefix and bootstraps us as a contact on their side, after
+/// which their first message back lands as a regular ratchet exchange.
+/// Best-effort — failures are logged so the user-visible add still
+/// succeeds locally even if the remote announce can't go through yet.
 async fn announce_to_new_contact(
     state: &State<'_, std::sync::Arc<AppState>>,
     contact: &Contact,
 ) -> anyhow::Result<()> {
     use crate::transport::envelopes::wrap_contact_request;
-    use crate::transport::mailbox;
 
-    let (my_bundle_bytes, sender_mb_hex, recipient_mb_hex) = {
+    let dest = match contact.i2p_destination.as_deref() {
+        Some(d) if d.len() >= 400 => d,
+        _ => {
+            tracing::info!(
+                "announce_to_new_contact: `{}` has no i2p_destination — skipping (they need to add us back)",
+                contact.alias
+            );
+            return Ok(());
+        }
+    };
+
+    let my_bundle_bytes = {
         let guard = state.vault.lock();
         let rt = guard.as_ref().ok_or_else(|| anyhow!("vault locked"))?;
         let my_bundle = identity::build_published_bundle(&rt.db, &rt.identity)?;
-        let bytes = bundle::serialize(&my_bundle);
-
-        let me_pub = rt.identity.keys.ed25519_verifying().to_bytes();
-        let sender = mailbox::hex(&mailbox::current_mailbox(&me_pub));
-        let recipient = mailbox::hex(&mailbox::current_mailbox(&contact.ed25519_public));
-        (bytes, sender, recipient)
+        bundle::serialize(&my_bundle)
     };
 
     let envelope = wrap_contact_request(&my_bundle_bytes);
-    let mut blob = Vec::with_capacity(32 + envelope.len());
-    blob.extend_from_slice(sender_mb_hex.as_bytes());
-    blob.extend_from_slice(&envelope);
 
-    let msg_id = Uuid::new_v4().to_string();
-    let home = state.relay.current_url();
-    let target = match contact.relay_url.as_deref() {
-        Some(c) if !c.is_empty() && Some(c) != home.as_deref() => Some(c.to_string()),
-        _ => None,
+    let i2p_runtime = {
+        let slot = state.i2p.lock().await;
+        slot.as_ref().cloned()
     };
-
-    match target {
-        Some(url) => {
-            tracing::info!(
-                "contact-request: cross-relay deposit to {} for `{}`",
-                url,
-                contact.alias
-            );
-            let pin = lookup_relay_pin(&state, &url);
-            let result = crate::transport::relay::transient_deposit(
-                &url,
-                &recipient_mb_hex,
-                &blob,
-                60 * 60 * 24,
-                std::time::Duration::from_secs(10),
-                pin,
-            )
-            .await;
-            record_transient_deposit(&state, &url, &result);
-            let captured = result.map_err(|e| anyhow!("transient deposit: {e}"))?;
-            persist_relay_pin_if_new(&state, &url, pin, captured);
-        }
-        None => {
-            state
-                .relay
-                .deposit(recipient_mb_hex.clone(), &blob, 60 * 60 * 24, msg_id)
-                .map_err(|e| anyhow!("deposit contact request: {e}"))?;
-        }
-    }
+    let Some(rt) = i2p_runtime else {
+        tracing::warn!(
+            "announce_to_new_contact: I2P runtime not ready; will retry on next vault unlock"
+        );
+        return Ok(());
+    };
+    rt.connection
+        .send_blob(
+            dest,
+            crate::transport::i2p::framing::FrameType::Message,
+            &envelope,
+        )
+        .await
+        .map_err(|e| anyhow!("i2p contact-request: {e}"))?;
     tracing::info!(
-        "contact-request: deposited {} bytes for `{}` (mailbox `{}`)",
-        blob.len(),
-        contact.alias,
-        recipient_mb_hex
+        "contact-request: I2P-delivered {} bytes to `{}`",
+        envelope.len(),
+        contact.alias
     );
     Ok(())
 }
@@ -1444,7 +1340,7 @@ pub async fn message_send(
         let relay_url = contact
             .relay_url
             .clone()
-            .or_else(|| state.relay.current_url())
+            .or_else(|| -> Option<String> { None })
             .ok_or("no relay URL")?;
         (contact, conv, relay_url)
     };
@@ -1464,7 +1360,7 @@ pub async fn message_send(
     let prepared = {
         let guard = state.vault.lock();
         let rt = guard.as_ref().ok_or("vault locked")?;
-        let home = state.relay.current_url();
+        let home: Option<String> = None;
         sender::prepare_send_text(
             &rt.db,
             &rt.identity,
@@ -1605,7 +1501,7 @@ pub async fn message_send_detonating(
         let relay_url = contact
             .relay_url
             .clone()
-            .or_else(|| state.relay.current_url())
+            .or_else(|| -> Option<String> { None })
             .ok_or("no relay URL")?;
         (contact, conv, relay_url)
     };
@@ -1618,7 +1514,7 @@ pub async fn message_send_detonating(
     let prepared = {
         let guard = state.vault.lock();
         let rt = guard.as_ref().ok_or("vault locked")?;
-        let home = state.relay.current_url();
+        let home: Option<String> = None;
         sender::prepare_send_detonating_text(
             &rt.db,
             &rt.identity,
@@ -2069,7 +1965,7 @@ pub async fn message_send_attachment(
         let relay_url = contact
             .relay_url
             .clone()
-            .or_else(|| state.relay.current_url())
+            .or_else(|| -> Option<String> { None })
             .ok_or("no relay URL")?;
         (contact, conv, relay_url)
     };
@@ -2081,7 +1977,7 @@ pub async fn message_send_attachment(
     let prepared = {
         let guard = state.vault.lock();
         let rt = guard.as_ref().ok_or("vault locked")?;
-        let home = state.relay.current_url();
+        let home: Option<String> = None;
         sender::prepare_send_attachment(
             &rt.db,
             &rt.identity,
@@ -2183,22 +2079,6 @@ pub async fn attachment_save_as(
 // relay
 // =====================================================================
 
-#[derive(Serialize)]
-pub struct RelayStatus {
-    pub url: Option<String>,
-    pub connected: bool,
-    pub frame_counters: crate::transport::frame_accounting::Snapshot,
-}
-
-#[tauri::command]
-pub async fn relay_status(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<RelayStatus> {
-    Ok(RelayStatus {
-        url: state.relay.current_url(),
-        connected: state.relay.current_url().is_some(),
-        frame_counters: state.relay.counters().snapshot(),
-    })
-}
-
 /// Snapshot of the I2P transport state for the security dashboard.
 #[derive(Serialize)]
 pub struct I2pStatus {
@@ -2284,311 +2164,6 @@ pub async fn i2p_status(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult
             log_path: String::new(),
             cached_outbound_streams: 0,
         }),
-    }
-}
-
-/// Change the home relay URL: persist, re-sign manifest, reconnect, and
-/// broadcast `relay_update` envelopes to every contact so they route future
-/// deposits to the new URL. Records the previous URL to enable 14-day
-/// grace-period polling.
-#[tauri::command]
-pub async fn relay_change_url(
-    new_url: String,
-    state: State<'_, std::sync::Arc<AppState>>,
-    app: tauri::AppHandle,
-) -> CmdResult<()> {
-    if !(new_url.starts_with("ws://") || new_url.starts_with("wss://")) {
-        return Err("relay URL must start with ws:// or wss://".into());
-    }
-    relay_connect(new_url.clone(), state.clone(), app.clone()).await?;
-    if let Err(e) = identity_publish_bundle(state.clone()).await {
-        tracing::warn!("relay_change_url: bundle republish failed: {e}");
-    }
-
-    use crate::crypto::message_crypto::{
-        build_aad, build_relay_update_envelope, pack_text_wire, pad_pkcs7, RatchetWire,
-    };
-    use crate::crypto::ratchet;
-    use crate::crypto::PAD_BLOCK;
-    use crate::messaging::ratchet_store;
-    use crate::transport::mailbox;
-    use std::time::Duration;
-
-    let now_ms = now_unix_ms();
-    let (contacts, me_pub) = {
-        let guard = state.vault.lock();
-        let rt = guard.as_ref().ok_or("vault locked")?;
-        (
-            rt.db.list_contacts().map_err(err)?,
-            rt.identity.keys.ed25519_verifying().to_bytes(),
-        )
-    };
-    let sender_mb_hex = mailbox::hex(&mailbox::current_mailbox(&me_pub));
-
-    for contact in contacts {
-        let envelope = build_relay_update_envelope(now_ms as u64, &new_url);
-        let padded = pad_pkcs7(&envelope, PAD_BLOCK);
-
-        let prepared = {
-            let guard = state.vault.lock();
-            let rt = match guard.as_ref() {
-                Some(rt) => rt,
-                None => break,
-            };
-            let mut ratchet_state = match ratchet_store::load(&rt.db, &contact.id).ok().flatten() {
-                Some(s) => s,
-                None => continue,
-            };
-            let enc = match ratchet::encrypt_message(&mut ratchet_state, &padded, build_aad) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let wire = match pack_text_wire(&RatchetWire {
-                ratchet_key: &enc.ratchet_key,
-                prev_chain_len: enc.prev_chain_len,
-                msg_num: enc.msg_num,
-                nonce: &enc.nonce,
-                ciphertext: &enc.ciphertext,
-                sentinel_digest: None,
-            }) {
-                Ok(w) => w,
-                Err(_) => continue,
-            };
-            let _ = ratchet_store::save(&rt.db, &contact.id, &ratchet_state);
-
-            let recipient_mb_hex =
-                mailbox::hex(&mailbox::current_mailbox(&contact.ed25519_public));
-            let mut blob = Vec::with_capacity(32 + wire.len());
-            blob.extend_from_slice(sender_mb_hex.as_bytes());
-            blob.extend_from_slice(&wire);
-            (blob, recipient_mb_hex, contact.relay_url.clone())
-        };
-
-        let (blob, recipient_mb_hex, target) = prepared;
-        let home = state.relay.current_url();
-        let cross = match (target.as_deref(), home.as_deref()) {
-            (Some(t), Some(h)) if !t.is_empty() && t != h => Some(t.to_string()),
-            (Some(t), None) if !t.is_empty() => Some(t.to_string()),
-            _ => None,
-        };
-        match cross {
-            Some(url) => {
-                let pin = lookup_relay_pin(&state, &url);
-                let result = crate::transport::relay::transient_deposit(
-                    &url,
-                    &recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    Duration::from_secs(10),
-                    pin,
-                )
-                .await;
-                record_transient_deposit(&state, &url, &result);
-                if let Ok(captured) = result {
-                    persist_relay_pin_if_new(&state, &url, pin, captured);
-                }
-            }
-            None => {
-                let _ = state.relay.deposit(
-                    recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    uuid::Uuid::new_v4().to_string(),
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn relay_set_url(url: String, _state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<()> {
-    // Minimal: accept any ws/wss URL. The signed-manifest flow is layered on
-    // later when Secure Enclave signing lands.
-    if !(url.starts_with("ws://") || url.starts_with("wss://")) {
-        return Err("relay URL must start with ws:// or wss://".into());
-    }
-    keychain::write(keychain::ACCOUNT_DB_PATH, url.as_bytes()).map_err(err)?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn relay_connect(
-    url: String,
-    state: tauri::State<'_, std::sync::Arc<AppState>>,
-    app: tauri::AppHandle,
-) -> CmdResult<()> {
-    tracing::info!("relay_connect: connecting to {}", url);
-
-    // ===== Record this URL as the home relay (drives bundle.relay_url). =====
-    // Detect URL change vs. previously-stored home: if it changed, kick off
-    // the 14-day grace-period polling of the old relay so messages contacts
-    // deposited there before they processed our `relay_update` aren't lost.
-    {
-        let guard = state.vault.lock();
-        let rt = guard.as_ref().ok_or("vault locked")?;
-        let prior = rt.db.settings_get("home_relay_url").ok().flatten();
-        if let Some(prev) = prior.as_deref() {
-            if prev != url {
-                rt.db
-                    .settings_put("previous_relay_url", prev)
-                    .map_err(err)?;
-                rt.db
-                    .settings_put(
-                        "relay_migration_started_at",
-                        &now_unix_ms().to_string(),
-                    )
-                    .map_err(err)?;
-                tracing::info!(
-                    "relay_connect: home relay changed from {} to {} — grace period started",
-                    prev,
-                    url
-                );
-            }
-        }
-        rt.db.settings_put("home_relay_url", &url).map_err(err)?;
-    }
-
-    // ===== Configuration manifest verification =====
-    // Compute the manifest digest for this URL (binding the stored TLS pin
-    // when present) and either verify a stored signature or install a TOFU
-    // one signed with our manifest signer. Refuse to connect if a stored
-    // signature exists but doesn't verify — that's a tampering signal.
-    {
-        let guard = state.vault.lock();
-        let rt = guard.as_ref().ok_or("vault locked")?;
-        let stored_pin_for_digest = rt
-            .db
-            .settings_get(&crate::transport::relay::pin_settings_key(&url))
-            .ok()
-            .flatten()
-            .and_then(|h| hex::decode(h).ok())
-            .and_then(|b| <[u8; 32]>::try_from(b).ok());
-        let digest = crate::crypto::config_manifest::manifest_digest(
-            &url,
-            stored_pin_for_digest.as_ref().map(|p| p.as_slice()),
-        );
-
-        let stored_sig_hex = rt.db.settings_get("manifest_signature").map_err(err)?;
-        let stored_url = rt.db.settings_get("manifest_relay_url").map_err(err)?;
-        let pubkey_hex = rt
-            .db
-            .settings_get("manifest_verifying_key")
-            .map_err(err)?
-            .ok_or("manifest verifying key missing")?;
-        let pubkey_bytes: [u8; 32] = hex::decode(&pubkey_hex)
-            .map_err(|_| "manifest verifying key not hex".to_string())?
-            .try_into()
-            .map_err(|_| "manifest verifying key not 32 bytes".to_string())?;
-
-        match (stored_sig_hex, stored_url) {
-            (Some(sig_hex), Some(stored_url)) if stored_url == url => {
-                let sig_bytes: [u8; 64] = hex::decode(&sig_hex)
-                    .map_err(|_| "manifest signature not hex".to_string())?
-                    .try_into()
-                    .map_err(|_| "manifest signature not 64 bytes".to_string())?;
-                if let Err(e) = crate::crypto::config_manifest::verify(
-                    &pubkey_bytes,
-                    &digest,
-                    &sig_bytes,
-                ) {
-                    tracing::error!("relay_connect: MANIFEST TAMPERED — refusing connect: {e}");
-                    use tauri::Emitter;
-                    let _ = app.emit(
-                        "security:manifest_tampered",
-                        serde_json::json!({ "url": url }),
-                    );
-                    return Err("config manifest signature failed to verify".into());
-                }
-                tracing::info!("relay_connect: manifest verified ✓");
-            }
-            _ => {
-                // First connect (TOFU) or URL change. Sign the new manifest
-                // with the in-memory signer and persist.
-                let sig =
-                    crate::crypto::config_manifest::sign(&rt.manifest_seed, &digest);
-                rt.db
-                    .settings_put("manifest_signature", &hex::encode(sig))
-                    .map_err(err)?;
-                rt.db
-                    .settings_put("manifest_relay_url", &url)
-                    .map_err(err)?;
-                tracing::info!("relay_connect: manifest signed (TOFU/url-change)");
-            }
-        }
-    }
-
-    let stored_pin = lookup_relay_pin(&state, &url);
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let tx_for_periodic = tx.clone();
-    match state.relay.connect(url.clone(), stored_pin, tx).await {
-        Ok(captured_pin) => {
-            tracing::info!("relay_connect: ws connected to {}", url);
-            // TOFU: first time we see this URL, persist the pin and re-sign
-            // the manifest digest so future verifies cover the TLS identity.
-            if let Some(pin) = captured_pin {
-                if stored_pin.is_none() {
-                    let guard = state.vault.lock();
-                    if let Some(rt) = guard.as_ref() {
-                        let _ = rt.db.settings_put(
-                            &crate::transport::relay::pin_settings_key(&url),
-                            &hex::encode(pin),
-                        );
-                        let new_digest = crate::crypto::config_manifest::manifest_digest(
-                            &url,
-                            Some(&pin),
-                        );
-                        let new_sig = crate::crypto::config_manifest::sign(
-                            &rt.manifest_seed,
-                            &new_digest,
-                        );
-                        let _ = rt
-                            .db
-                            .settings_put("manifest_signature", &hex::encode(new_sig));
-                        tracing::info!(
-                            "relay_connect: TOFU pin captured, manifest re-signed with TLS pin"
-                        );
-                    }
-                }
-            }
-            let state_arc = state_arc_for_pump(&app);
-            inbound::spawn_pump(app.clone(), state_arc.clone(), state.relay.clone(), rx);
-
-            // Periodic background tasks: fallback retrieve every 30 s and
-            // frame-accounting reconciliation every 60 s. The pump receives
-            // the responses and runs the verdict.
-            if let Some(me_pk) = me_pubkey(&state) {
-                let client = state.relay.clone();
-                tokio::spawn(crate::transport::relay::run_periodic_tasks(
-                    client,
-                    me_pk.to_vec(),
-                    state_arc.clone(),
-                    tx_for_periodic,
-                    app.clone(),
-                ));
-            }
-
-            // Kick off an immediate retrieve so anything the relay still
-            // has for us shows up without waiting for the next notify.
-            if let Some(me_pk) = me_pubkey(&state) {
-                let real = crate::transport::mailbox::current_mailbox(&me_pk);
-                let batch = crate::transport::mailbox::build_retrieve_batch(&real);
-                let hex: Vec<String> = batch.iter().map(crate::transport::mailbox::hex).collect();
-                let _ = state.relay.retrieve(hex);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            tracing::error!("relay_connect: connect failed: {e}");
-            if matches!(e, crate::transport::TransportError::TlsPinMismatch) {
-                use tauri::Emitter;
-                let _ = app.emit(
-                    "security:tls_pin_mismatch",
-                    serde_json::json!({ "url": url }),
-                );
-            }
-            Err(err(e))
-        }
     }
 }
 
@@ -2798,13 +2373,6 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-#[tauri::command]
-pub async fn cross_relay_stats(
-    state: State<'_, std::sync::Arc<AppState>>,
-) -> CmdResult<Vec<crate::transport::cross_relay_stats::RelayUsage>> {
-    Ok(state.cross_relay.snapshot())
-}
-
 // =====================================================================
 // dashboard
 // =====================================================================
@@ -2813,45 +2381,36 @@ pub async fn cross_relay_stats(
 pub struct SecurityStatus {
     pub vault_unlocked: bool,
     pub hardware_tier: HardwareTier,
+    /// Legacy fields kept on the wire for the frontend's `SecurityStatus`
+    /// TS interface — always None / false / zero now that the relay is
+    /// gone. Will be dropped together with the TS type in a follow-up.
     pub relay_connected: bool,
     pub relay_url: Option<String>,
-    pub frame_counters: crate::transport::frame_accounting::Snapshot,
+    pub frame_counters: FrameCountersStub,
     pub manifest_verified: bool,
     pub manifest_signed_url: Option<String>,
-    /// Hex-encoded SHA-256 of the home relay's leaf certificate SPKI, if a
-    /// pin has been captured. `None` for plaintext (`ws://`) relays or
-    /// before the first successful TOFU handshake.
     pub tls_pin_hex: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+pub struct FrameCountersStub {
+    pub frames_sent: u64,
+    pub frames_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 #[tauri::command]
 pub async fn security_status(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<SecurityStatus> {
-    let url = state.relay.current_url();
-    let (manifest_verified, manifest_signed_url, tls_pin_hex) = {
-        let guard = state.vault.lock();
-        match guard.as_ref() {
-            None => (false, None, None),
-            Some(rt) => {
-                let (mv, msu) = verify_manifest_for(rt, url.as_deref());
-                let pin = url.as_deref().and_then(|u| {
-                    rt.db
-                        .settings_get(&crate::transport::relay::pin_settings_key(u))
-                        .ok()
-                        .flatten()
-                });
-                (mv, msu, pin)
-            }
-        }
-    };
     Ok(SecurityStatus {
         vault_unlocked: state.is_unlocked(),
         hardware_tier: secure_enclave::detect_tier(),
-        relay_connected: url.is_some(),
-        relay_url: url,
-        frame_counters: state.relay.counters().snapshot(),
-        manifest_verified,
-        manifest_signed_url,
-        tls_pin_hex,
+        relay_connected: false,
+        relay_url: None,
+        frame_counters: FrameCountersStub::default(),
+        manifest_verified: false,
+        manifest_signed_url: None,
+        tls_pin_hex: None,
     })
 }
 

@@ -27,124 +27,6 @@ use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 
 use crate::transport::mailbox::MAILBOX_PREFIX_LEN;
 
-/// Spawn the inbound pump. Owns `events_rx`; emits `message:received` on
-/// every successful decode. Exits when the channel closes.
-pub fn spawn_pump(
-    app: AppHandle,
-    state: Arc<AppState>,
-    relay: RelayClient,
-    mut events_rx: mpsc::UnboundedReceiver<InboundEvent>,
-) {
-    tokio::spawn(async move {
-        tracing::info!("inbound pump: started");
-        while let Some(evt) = events_rx.recv().await {
-            match evt {
-                InboundEvent::Notify => {
-                    // Trigger an immediate retrieve via the relay client.
-                    if let Some(me_pk) = me_pubkey(&state) {
-                        let real = mailbox::current_mailbox(&me_pk);
-                        let batch = mailbox::build_retrieve_batch(&real);
-                        let hex: Vec<String> = batch.iter().map(mailbox::hex).collect();
-                        let _ = relay.retrieve(hex);
-                    }
-                }
-                InboundEvent::Delivery(mailboxes) => {
-                    for slot in mailboxes {
-                        for blob_b64 in slot.blobs {
-                            if let Err(e) = handle_one(&app, &state, &blob_b64).await {
-                                tracing::warn!("inbound: skip blob: {e:#}");
-                            }
-                        }
-                    }
-                }
-                InboundEvent::Deposited { message_id, ok } => {
-                    tracing::info!("inbound: deposited id={message_id} ok={ok}");
-                    // Don't downgrade a row already promoted to "delivered"
-                    // by a delivery receipt — only flip "queued" → "sent".
-                    if ok && !message_id.is_empty() {
-                        let new_status = "sent";
-                        let updated = {
-                            let guard = state.vault.lock();
-                            match guard.as_ref() {
-                                Some(rt) => {
-                                    let _ = rt.db.conn.execute(
-                                        "UPDATE messages SET status = ?1
-                                         WHERE id = ?2 AND status = 'queued'",
-                                        rusqlite::params![new_status, &message_id],
-                                    );
-                                    true
-                                }
-                                None => false,
-                            }
-                        };
-                        if updated {
-                            #[derive(serde::Serialize, Clone)]
-                            struct Status<'a> {
-                                message_id: &'a str,
-                                status: &'a str,
-                            }
-                            let _ = app.emit(
-                                "message:status",
-                                Status {
-                                    message_id: &message_id,
-                                    status: new_status,
-                                },
-                            );
-                        }
-                    }
-                }
-                InboundEvent::AccountingResponse(rc) => {
-                    let snapshot = relay.counters().snapshot();
-                    let verdict = crate::transport::frame_accounting::reconcile(snapshot, rc);
-                    use crate::transport::frame_accounting::AccountingVerdict;
-                    let (severity, label) = match verdict {
-                        AccountingVerdict::Verified => ("ok", "verified"),
-                        AccountingVerdict::FrameDrop => ("warn", "frame_drop"),
-                        AccountingVerdict::FrameInjectionExfil => {
-                            ("critical", "injection_exfil")
-                        }
-                        AccountingVerdict::FrameInjectionFromRelay => {
-                            ("critical", "injection_from_relay")
-                        }
-                    };
-                    tracing::info!(
-                        "frame accounting verdict={label} severity={severity} \
-                         client(↑sent={} ↓rcv={}) relay(rcv_from_us={} sent_to_us={})",
-                        snapshot.frames_sent,
-                        snapshot.frames_received,
-                        rc.frames_received_from_client,
-                        rc.frames_sent_to_client,
-                    );
-                    #[derive(serde::Serialize, Clone)]
-                    struct Payload<'a> {
-                        verdict: &'a str,
-                        severity: &'a str,
-                        client_sent: u64,
-                        client_received: u64,
-                        relay_received_from_client: u64,
-                        relay_sent_to_client: u64,
-                    }
-                    let _ = app.emit(
-                        "security:frame_accounting",
-                        Payload {
-                            verdict: label,
-                            severity,
-                            client_sent: snapshot.frames_sent,
-                            client_received: snapshot.frames_received,
-                            relay_received_from_client: rc.frames_received_from_client,
-                            relay_sent_to_client: rc.frames_sent_to_client,
-                        },
-                    );
-                }
-                InboundEvent::Error(e) => {
-                    tracing::warn!("inbound: relay error: {e}");
-                }
-            }
-        }
-        tracing::info!("inbound pump: events channel closed; pump exiting");
-    });
-}
-
 fn me_pubkey(state: &AppState) -> Option<[u8; 32]> {
     let guard = state.vault.lock();
     guard
@@ -318,7 +200,7 @@ async fn handle_contact_request(
             ed25519_public: parsed.identity_key.to_vec(),
             x25519_public: parsed.x25519_key.to_vec(),
             mlkem_public: parsed.kyber_key.clone(),
-            relay_url: state.relay.current_url(),
+            relay_url: None,
             i2p_destination,
             verified: false,
             peer_has_verified_us: false,
@@ -446,8 +328,6 @@ async fn handle_first(
     // session-init for Alice's identity X25519 pub key and derive her alias
     // (we need her bundle from the relay to fill in details like ML-KEM pub).
     let init = parse_session_init(&init_bytes)?;
-    let relay_url = state.relay.current_url().ok_or_else(|| anyhow!("no relay"))?;
-    let _ = relay_url;
 
     // Derive the candidate alias from the X25519 public key — wait, the alias
     // is derived from the Ed25519 identity key, which is *not* in the
@@ -846,50 +726,12 @@ fn bootstrap_responder(
     Ok(state)
 }
 
-/// Spawn a background task that re-fetches the next unconsumed OTPK +
-/// re-signs the bundle + PUTs it to the relay. Best-effort: a network
-/// failure leaves the stale bundle in place — the next consumed OTPK
-/// retries.
-fn schedule_bundle_republish() {
-    let state_arc = match crate::commands::shared_state() {
-        Some(a) => a,
-        None => return,
-    };
-    tokio::spawn(async move {
-        let (bundle_bytes, alias, relay_url) = {
-            let guard = state_arc.vault.lock();
-            let Some(rt) = guard.as_ref() else { return };
-            let bundle = match crate::identity::build_published_bundle(&rt.db, &rt.identity)
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("republish: build_published_bundle failed: {e}");
-                    return;
-                }
-            };
-            let bytes = crate::crypto::bundle::serialize(&bundle);
-            let alias = rt.identity.alias.clone();
-            let url = match state_arc.relay.current_url() {
-                Some(u) => u,
-                None => {
-                    tracing::warn!("republish: no relay URL");
-                    return;
-                }
-            };
-            (bytes, alias, url)
-        };
-        if let Err(e) =
-            crate::transport::bundle_registry::put_bundle(&relay_url, &alias, &bundle_bytes)
-                .await
-        {
-            tracing::warn!("republish: PUT failed for `{alias}`: {e}");
-        } else {
-            tracing::info!(
-                "republish: bumped bundle for `{alias}` after OTPK consumption"
-            );
-        }
-    });
-}
+/// No-op since the relay-side bundle directory is gone. With I2P-only
+/// transport, peers receive each new OTPK by way of the bundle they
+/// already cached at contact-add time; rotation happens lazily as
+/// PQ-X3DH responder bootstraps reuse the same x25519 + advance the
+/// chain. Kept as a stub so existing call sites compile.
+fn schedule_bundle_republish() {}
 
 struct ParsedSessionInit {
     initiator_x25519_pub: Vec<u8>,
@@ -1092,12 +934,32 @@ fn send_delivery_receipt(
     let mut blob = Vec::with_capacity(MAILBOX_PREFIX_LEN + wire.len());
     blob.extend_from_slice(sender_mb_hex.as_bytes());
     blob.extend_from_slice(&wire);
+    let _ = recipient_mb_hex;
 
-    let id = uuid::Uuid::new_v4().to_string();
-    state
-        .relay
-        .deposit(recipient_mb_hex, &blob, 60 * 60 * 24, id)
-        .map_err(|e| anyhow!("deposit receipt: {e}"))?;
+    // Send the delivery receipt via I2P to the contact's destination.
+    let i2p_runtime_arc = state.i2p.try_lock().ok().and_then(|g| g.clone());
+    let Some(rt_i2p) = i2p_runtime_arc else {
+        tracing::debug!("delivery-receipt: I2P runtime not ready; skipping");
+        return Ok(());
+    };
+    let Some(dest) = contact.i2p_destination.as_deref() else {
+        tracing::debug!("delivery-receipt: no i2p_destination for {}", contact.alias);
+        return Ok(());
+    };
+    if let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) {
+        let dest = dest.to_string();
+        let inner = inner.to_vec();
+        let conn = rt_i2p.connection.clone();
+        tokio::spawn(async move {
+            let _ = conn
+                .send_blob(
+                    &dest,
+                    crate::transport::i2p::framing::FrameType::Message,
+                    &inner,
+                )
+                .await;
+        });
+    }
     Ok(())
 }
 
@@ -1360,35 +1222,26 @@ fn broadcast_sender_key(
                 ))
             };
 
-            let Some((blob, recipient_mb_hex, target)) = prepared else {
+            let Some((blob, _recipient_mb_hex, _target)) = prepared else {
                 continue;
             };
-            let home = state_arc.relay.current_url();
-            let cross = match (target.as_deref(), home.as_deref()) {
-                (Some(t), Some(h)) if !t.is_empty() && t != h => Some(t.to_string()),
-                (Some(t), None) if !t.is_empty() => Some(t.to_string()),
-                _ => None,
+            let i2p_runtime = {
+                let slot = state_arc.i2p.lock().await;
+                slot.as_ref().cloned()
             };
-            match cross {
-                Some(url) => {
-                    let _ = crate::transport::relay::transient_deposit(
-                        &url,
-                        &recipient_mb_hex,
-                        &blob,
-                        60 * 60 * 24,
-                        Duration::from_secs(10),
-                        None,
+            let Some(rt) = i2p_runtime else { continue };
+            let Some(dest) = contact.i2p_destination.as_deref() else {
+                continue;
+            };
+            if let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) {
+                let _ = rt
+                    .connection
+                    .send_blob(
+                        dest,
+                        crate::transport::i2p::framing::FrameType::Message,
+                        inner,
                     )
                     .await;
-                }
-                None => {
-                    let _ = state_arc.relay.deposit(
-                        recipient_mb_hex,
-                        &blob,
-                        60 * 60 * 24,
-                        uuid::Uuid::new_v4().to_string(),
-                    );
-                }
             }
         }
     });
@@ -1491,39 +1344,28 @@ fn reciprocate_sender_key(peer: &Contact, room_id: &[u8; 16]) {
             (blob, recipient_mb_hex, peer.relay_url.clone())
         };
 
-        let (blob, recipient_mb_hex, target) = prepared;
-        let home = state_arc.relay.current_url();
-        let cross = match (target.as_deref(), home.as_deref()) {
-            (Some(t), Some(h)) if !t.is_empty() && t != h => Some(t.to_string()),
-            (Some(t), None) if !t.is_empty() => Some(t.to_string()),
-            _ => None,
+        let (blob, _recipient_mb_hex, _target) = prepared;
+        let i2p_runtime = {
+            let slot = state_arc.i2p.lock().await;
+            slot.as_ref().cloned()
         };
-        match cross {
-            Some(url) => {
-                let _ = crate::transport::relay::transient_deposit(
-                    &url,
-                    &recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    std::time::Duration::from_secs(10),
-                    None,
+        let Some(rt) = i2p_runtime else { return };
+        let Some(dest) = peer.i2p_destination.as_deref() else { return };
+        if let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) {
+            let _ = rt
+                .connection
+                .send_blob(
+                    dest,
+                    crate::transport::i2p::framing::FrameType::Message,
+                    inner,
                 )
                 .await;
-            }
-            None => {
-                let _ = state_arc.relay.deposit(
-                    recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    uuid::Uuid::new_v4().to_string(),
-                );
-            }
+            tracing::info!(
+                "reciprocate: sent my sender-key for room {} to `{}` via I2P",
+                &room_uuid[..8],
+                peer.alias
+            );
         }
-        tracing::info!(
-            "reciprocate: sent my sender-key for room {} to `{}`",
-            &room_uuid[..8],
-            peer.alias
-        );
     });
 }
 
@@ -1544,115 +1386,22 @@ fn reciprocate_sender_key(peer: &Contact, room_id: &[u8; 16]) {
 ///
 /// Net effect: exactly one PQ-X3DH session per pair, no race.
 fn bootstrap_unknown_room_peers(
-    room_id_bytes: [u8; 16],
-    chain_seed: [u8; 32],
+    _room_id_bytes: [u8; 16],
+    _chain_seed: [u8; 32],
     unknown_pubkeys: Vec<[u8; 32]>,
 ) {
-    use crate::crypto::keys::derive_alias;
-    let state_arc = match crate::commands::shared_state() {
-        Some(a) => a,
-        None => return,
-    };
-    let me_pub = {
-        let guard = state_arc.vault.lock();
-        match guard.as_ref() {
-            Some(rt) => rt.identity.keys.ed25519_verifying().to_bytes(),
-            None => return,
-        }
-    };
-    tokio::spawn(async move {
-        let relay_url = match state_arc.relay.current_url() {
-            Some(u) => u,
-            None => {
-                tracing::warn!("room-bootstrap: no home relay; skipping");
-                return;
-            }
-        };
-        for pk in unknown_pubkeys {
-            let alias = derive_alias(&pk);
-            // Deterministic role: smaller pubkey initiates.
-            let i_should_initiate = me_pub.as_slice() < pk.as_slice();
-            tracing::info!(
-                "room-bootstrap: peer `{}` — i_should_initiate={}",
-                alias,
-                i_should_initiate
-            );
-            let bundle = match crate::transport::bundle_registry::get_bundle(
-                &relay_url,
-                &alias,
-            )
-            .await
-            {
-                Ok(Some(b)) => b,
-                Ok(None) => {
-                    tracing::warn!("room-bootstrap: no bundle for `{}`", alias);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!("room-bootstrap: bundle fetch for `{}`: {}", alias, e);
-                    continue;
-                }
-            };
-            if bundle.identity_key != pk {
-                tracing::warn!(
-                    "room-bootstrap: bundle for `{}` has different identity key — relay tampering?",
-                    alias
-                );
-                continue;
-            }
-            let new_contact = match persist_room_peer_as_contact(&state_arc, &bundle) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        "room-bootstrap: persist contact for `{}` failed: {}",
-                        alias,
-                        e
-                    );
-                    continue;
-                }
-            };
-
-            if !i_should_initiate {
-                // Wait for the peer to initiate. Their first-message wrapper
-                // will arrive at us, handle_first will resolve them (we just
-                // persisted them as a contact), and run_decrypt will
-                // bootstrap_responder — establishing the single session.
-                tracing::info!(
-                    "room-bootstrap: persisted `{}` and waiting for their initiation",
-                    new_contact.alias
-                );
-                continue;
-            }
-
-            // I initiate. Send contact-request first so the peer adds me as
-            // a contact (their handle_first needs to resolve my mailbox to
-            // me before it can call run_decrypt on my first-message wire).
-            if let Err(e) = announce_to_peer(&state_arc, &new_contact).await {
-                tracing::warn!(
-                    "room-bootstrap: contact-request to `{}`: {}",
-                    new_contact.alias,
-                    e
-                );
-                continue;
-            }
-
-            // Then share our sender-key seed via PQ-X3DH initiator.
-            if let Err(e) = send_room_sender_key_to(
-                &state_arc,
-                &new_contact,
-                &room_id_bytes,
-                &chain_seed,
-            )
-            .await
-            {
-                tracing::warn!(
-                    "room-bootstrap: sender-key share to `{}`: {}",
-                    new_contact.alias,
-                    e
-                );
-            }
-        }
-    });
+    // Pre-relay-removal this fetched each unknown peer's bundle from
+    // the relay's directory and bootstrapped a contact + ratchet
+    // against them. With I2P-only there is no directory, so the user
+    // must explicitly add each room participant via QR/whisper://
+    // link. Logged as a diagnostic so the user knows why a room
+    // member's messages aren't decryptable yet.
+    if !unknown_pubkeys.is_empty() {
+        tracing::warn!(
+            "room-bootstrap: {} unknown peer(s) in room — add them as contacts manually",
+            unknown_pubkeys.len()
+        );
+    }
 }
 
 /// Persist a room co-participant we just learned about via an invite.
@@ -1668,11 +1417,7 @@ fn persist_room_peer_as_contact(
     let guard = state.vault.lock();
     let rt = guard.as_ref().ok_or_else(|| anyhow!("vault locked"))?;
     let now = now_unix_ms();
-    let relay_url = if bundle.relay_url.is_empty() {
-        state.relay.current_url()
-    } else {
-        Some(bundle.relay_url.clone())
-    };
+    let relay_url: Option<String> = None;
 
     // If we already know this peer (e.g. the contact-request that arrived
     // milliseconds before the bootstrap finished racing), reuse that row.
@@ -1748,56 +1493,18 @@ fn persist_room_peer_as_contact(
 }
 
 /// Send our published bundle to `peer` as a contact-request envelope.
-/// Their `handle_contact_request` will persist us as a contact, after which
-/// our follow-up encrypted wires will resolve correctly.
-async fn announce_to_peer(state: &Arc<AppState>, peer: &Contact) -> Result<()> {
-    use crate::transport::envelopes::wrap_contact_request;
-    use crate::transport::mailbox;
-    let (my_bundle_bytes, sender_mb_hex, recipient_mb_hex) = {
-        let guard = state.vault.lock();
-        let rt = guard.as_ref().ok_or_else(|| anyhow!("vault locked"))?;
-        let my_bundle = crate::identity::build_published_bundle(&rt.db, &rt.identity)?;
-        let bytes = crate::crypto::bundle::serialize(&my_bundle);
-        let me_pub = rt.identity.keys.ed25519_verifying().to_bytes();
-        let sender = mailbox::hex(&mailbox::current_mailbox(&me_pub));
-        let recipient = mailbox::hex(&mailbox::current_mailbox(&peer.ed25519_public));
-        (bytes, sender, recipient)
-    };
-    let envelope = wrap_contact_request(&my_bundle_bytes);
-    let mut blob = Vec::with_capacity(32 + envelope.len());
-    blob.extend_from_slice(sender_mb_hex.as_bytes());
-    blob.extend_from_slice(&envelope);
-
-    let home = state.relay.current_url();
-    let target = match peer.relay_url.as_deref() {
-        Some(c) if !c.is_empty() && Some(c) != home.as_deref() => Some(c.to_string()),
-        _ => None,
-    };
-    match target {
-        Some(url) => {
-            crate::transport::relay::transient_deposit(
-                &url,
-                &recipient_mb_hex,
-                &blob,
-                60 * 60 * 24,
-                std::time::Duration::from_secs(10),
-                None,
-            )
-            .await
-            .map_err(|e| anyhow!("transient deposit: {e}"))?;
-        }
-        None => {
-            state
-                .relay
-                .deposit(
-                    recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    Uuid::new_v4().to_string(),
-                )
-                .map_err(|e| anyhow!("deposit: {e}"))?;
-        }
-    }
+/// Pre-relay-removal this used the relay's deposit/retrieve flow to
+/// announce us; with I2P-only transport, contact-request envelopes
+/// travel through the I2P stream just like every other message — but
+/// the room-invite flow that called this no longer needs an out-of-
+/// band announce because the bundle data is already carried inside
+/// the room invite. Kept as a no-op so existing call sites compile;
+/// can be deleted entirely once those call sites are pruned.
+async fn announce_to_peer(_state: &Arc<AppState>, peer: &Contact) -> Result<()> {
+    tracing::debug!(
+        "announce_to_peer: skip — relay path removed, room-invite flow doesn't need it for {}",
+        peer.alias
+    );
     Ok(())
 }
 
@@ -1821,17 +1528,18 @@ async fn send_room_sender_key_to(
     let envelope = build_room_sender_key_envelope(now_ms as u64, room_id, chain_seed);
     let padded = pad_pkcs7(&envelope, crate::crypto::PAD_BLOCK);
 
-    // Refetch the peer's bundle: the contact row only has identity bits, not
-    // their signed prekey + one-time prekey + ML-KEM public keys that
-    // PQ-X3DH initiator needs.
-    let relay_url = state
-        .relay
-        .current_url()
-        .ok_or_else(|| anyhow!("no relay"))?;
-    let bundle = crate::transport::bundle_registry::get_bundle(&relay_url, &peer.alias)
-        .await
-        .map_err(|e| anyhow!("re-fetch bundle for {}: {}", peer.alias, e))?
-        .ok_or_else(|| anyhow!("bundle missing for {}", peer.alias))?;
+    // Pre-relay-removal we re-fetched the peer's full bundle from the
+    // relay's directory because the contact row only has identity
+    // bits, not the prekey set PQ-X3DH initiator needs. With I2P-only
+    // there's no directory; this code path is reachable only from the
+    // disabled `bootstrap_unknown_room_peers`, so we just bail.
+    let _ = peer.alias.clone();
+    return Err(anyhow!(
+        "send_room_sender_key_to: relay-side bundle directory removed; peer must re-pair via QR"
+    ));
+    #[allow(unreachable_code)]
+    let bundle: crate::crypto::bundle::PublicKeyBundle = unreachable!();
+    #[allow(unreachable_code)]
     let peer_clone = peer.clone();
 
     // Bootstrap initiator + encrypt + pack + deposit, all under a short lock.
@@ -1862,36 +1570,36 @@ async fn send_room_sender_key_to(
         (blob, recipient_mb_hex, peer_clone.relay_url.clone())
     };
 
-    let home = state.relay.current_url();
-    let target = match target_relay.as_deref() {
-        Some(c) if !c.is_empty() && Some(c) != home.as_deref() => Some(c.to_string()),
-        _ => None,
+    // Send via I2P. The peer's i2p_destination must be on the contact
+    // row from the bundle exchange — without it we have no way to
+    // reach them and the room-key share is dropped (peer will see no
+    // messages from us in this room until they re-pair).
+    let _ = (target_relay, recipient_mb_hex);
+    let i2p_runtime = {
+        let slot = state.i2p.lock().await;
+        slot.as_ref().cloned()
     };
-    match target {
-        Some(url) => {
-            crate::transport::relay::transient_deposit(
-                &url,
-                &recipient_mb_hex,
-                &blob,
-                60 * 60 * 24,
-                std::time::Duration::from_secs(10),
-                None,
-            )
-            .await
-            .map_err(|e| anyhow!("transient deposit: {e}"))?;
-        }
-        None => {
-            state
-                .relay
-                .deposit(
-                    recipient_mb_hex,
-                    &blob,
-                    60 * 60 * 24,
-                    Uuid::new_v4().to_string(),
-                )
-                .map_err(|e| anyhow!("deposit: {e}"))?;
-        }
-    }
+    let Some(rt) = i2p_runtime else {
+        tracing::warn!("send_room_sender_key_to: I2P runtime not ready; sender key dropped");
+        return Ok(());
+    };
+    let Some(dest) = peer_clone.i2p_destination.as_deref() else {
+        tracing::warn!(
+            "send_room_sender_key_to: peer {} has no i2p_destination; sender key dropped",
+            peer_clone.alias
+        );
+        return Ok(());
+    };
+    let inner = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob)
+        .map_err(|e| anyhow!("strip mailbox prefix: {e}"))?;
+    rt.connection
+        .send_blob(
+            dest,
+            crate::transport::i2p::framing::FrameType::Message,
+            inner,
+        )
+        .await
+        .map_err(|e| anyhow!("i2p send: {e}"))?;
     Ok(())
 }
 
