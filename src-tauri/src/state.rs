@@ -4,6 +4,7 @@
 use crate::db::Database;
 use crate::identity::LoadedIdentity;
 use crate::transport::cross_relay_stats::CrossRelayStats;
+use crate::transport::i2p::runtime::I2PRuntime;
 use crate::transport::relay::RelayClient;
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -22,6 +23,11 @@ pub struct VaultRuntime {
 
 pub struct AppState {
     pub vault: Mutex<Option<VaultRuntime>>,
+    /// I2P transport state. None until the queue worker + i2pd come up
+    /// after vault_unlock. The unlock command spawns a background task
+    /// that fills this in once SAM is ready (~5-30 s). Sends issued
+    /// before this completes go through the relay path or get queued.
+    pub i2p: tokio::sync::Mutex<Option<Arc<I2PRuntime>>>,
     pub relay: RelayClient,
     pub cross_relay: Arc<CrossRelayStats>,
     pub paths: AppPaths,
@@ -36,6 +42,7 @@ impl AppState {
     pub fn new(paths: AppPaths) -> Self {
         Self {
             vault: Mutex::new(None),
+            i2p: tokio::sync::Mutex::new(None),
             relay: RelayClient::new(),
             cross_relay: CrossRelayStats::new(),
             paths,

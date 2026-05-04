@@ -83,31 +83,39 @@ pub fn store(db: &Database, dest: &PersistedDestination) -> DbResult<()> {
     Ok(())
 }
 
-/// Mint a fresh destination via the SAM bridge and store it. Idempotent
-/// in the sense that it always overwrites whatever is on the row — call
-/// [`load`] first if you only want to mint when missing.
+/// Mint a fresh destination via the SAM bridge and store it. The DB is
+/// behind a `parking_lot::Mutex` because `Database` (rusqlite Connection)
+/// is `Send` but not `Sync`; holding `&Database` across `.await` would
+/// make any wrapping future non-`Send`. The Mutex is `Sync` and we drop
+/// its guard before each await, so the resulting future *is* `Send`.
 pub async fn mint_and_store(
-    db: &Database,
+    db: &parking_lot::Mutex<Database>,
     sam_addr: &str,
 ) -> I2pResult<PersistedDestination> {
     let (pub_b64, priv_b64) = sam::dest_generate_oneshot(sam_addr).await?;
     let dest = PersistedDestination { pub_b64, priv_b64 };
-    store(db, &dest).map_err(|e| {
-        super::I2pError::Sam(format!("persist destination: {e}"))
-    })?;
+    {
+        let guard = db.lock();
+        store(&guard, &dest).map_err(|e| {
+            super::I2pError::Sam(format!("persist destination: {e}"))
+        })?;
+    }
     Ok(dest)
 }
 
-/// Load if present; otherwise mint and store. Returns the destination in
-/// either case. This is the canonical "get the destination, ensuring one
-/// exists" entry point used at vault-unlock time.
+/// Load if present; otherwise mint and store. Same async-Send rationale
+/// as [`mint_and_store`] for the Mutex wrapper.
 pub async fn load_or_mint(
-    db: &Database,
+    db: &parking_lot::Mutex<Database>,
     sam_addr: &str,
 ) -> I2pResult<PersistedDestination> {
-    if let Some(existing) = load(db).map_err(|e| {
-        super::I2pError::Sam(format!("load destination: {e}"))
-    })? {
+    let cached = {
+        let guard = db.lock();
+        load(&guard).map_err(|e| {
+            super::I2pError::Sam(format!("load destination: {e}"))
+        })?
+    };
+    if let Some(existing) = cached {
         return Ok(existing);
     }
     mint_and_store(db, sam_addr).await
@@ -117,7 +125,7 @@ pub async fn load_or_mint(
 /// rotation, contacts reach the *new* destination only after a
 /// `destination_update` control message is delivered to them — Phase 6.
 pub async fn rotate(
-    db: &Database,
+    db: &parking_lot::Mutex<Database>,
     sam_addr: &str,
 ) -> I2pResult<PersistedDestination> {
     mint_and_store(db, sam_addr).await

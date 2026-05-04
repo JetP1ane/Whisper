@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 
-const MAILBOX_PREFIX_LEN: usize = 32; // hex chars
+use crate::transport::mailbox::MAILBOX_PREFIX_LEN;
 
 /// Spawn the inbound pump. Owns `events_rx`; emits `message:received` on
 /// every successful decode. Exits when the channel closes.

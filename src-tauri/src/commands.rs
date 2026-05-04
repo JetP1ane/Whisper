@@ -346,11 +346,125 @@ pub async fn vault_unlock(passphrase: String, state: State<'_, std::sync::Arc<Ap
     .map_err(err)?;
 
     *state.vault.lock() = Some(result);
+
+    // Bring up the I2P transport in the background. The unlock UX
+    // doesn't wait — first-launch reseed + tunnel build can take ~30 s
+    // and we don't want to block the user. Sends issued before I2P is
+    // ready fall back to the relay path; the queue worker (Phase 6.5)
+    // will pick them up once SAM is online.
+    let dek_clone = state
+        .vault
+        .lock()
+        .as_ref()
+        .map(|rt| rt.dek.to_vec())
+        .ok_or("vault locked between unlock and i2p spawn")?;
+    spawn_i2p_start(std::sync::Arc::clone(&state), dek_clone);
+
     Ok(())
+}
+
+/// Spawn the I2P transport startup in a background task. The task
+/// opens its OWN Database handle (sharing the SQLCipher file via WAL)
+/// so it never needs to coordinate with the vault parking_lot Mutex
+/// for long-running async work. The handle survives until vault_lock.
+fn spawn_i2p_start(state: std::sync::Arc<AppState>, dek_bytes: Vec<u8>) {
+    let db_path = state.paths.db_file.clone();
+    tokio::spawn(async move {
+        // Open a second DB connection for the I2P runtime. SQLCipher
+        // with WAL (which we enable) handles multi-connection access
+        // safely. We zeroize the local DEK as soon as the open
+        // returns.
+        let mut dek = dek_bytes;
+        let db_key = match crate::crypto::secure_enclave::derive_db_key_with_enclave(
+            &dek.as_slice().try_into().unwrap_or([0u8; 32]),
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                use zeroize::Zeroize;
+                dek.zeroize();
+                tracing::warn!("i2p: derive_db_key_with_enclave failed: {e}");
+                return;
+            }
+        };
+        use zeroize::Zeroize;
+        dek.zeroize();
+        let db = match crate::db::Database::open(&db_path, &*db_key) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("i2p: secondary DB open failed: {e}");
+                return;
+            }
+        };
+
+        let enable_transit = db
+            .settings_get("i2p_enable_transit")
+            .ok()
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let profile_dir = crate::profile::data_dir();
+
+        // Phase 6 inbound dispatcher: log only. Phase 6.5 will route
+        // frames into messaging::inbound::process_inbound_payload.
+        let dispatcher: crate::transport::i2p::runtime::FrameDispatcher =
+            std::sync::Arc::new(|peer_dest, frame| {
+                Box::pin(async move {
+                    tracing::info!(
+                        "i2p: inbound frame {:?} ({} bytes) from {}",
+                        frame.kind,
+                        frame.payload.len(),
+                        &peer_dest[..16.min(peer_dest.len())]
+                    );
+                    Ok(())
+                })
+            });
+
+        match crate::transport::i2p::lifecycle::start(
+            db,
+            profile_dir,
+            enable_transit,
+            dispatcher,
+        )
+        .await
+        {
+            Ok(runtime) => {
+                let mut slot = state.i2p.lock().await;
+                *slot = Some(std::sync::Arc::new(runtime));
+                tracing::info!(
+                    "i2p: transport ready (transit={})",
+                    if enable_transit { "on" } else { "off" }
+                );
+            }
+            Err(e) => {
+                tracing::warn!("i2p: transport failed to start: {e}");
+            }
+        }
+        // The secondary `db` is now owned by the I2PManager inside the
+        // runtime; it stays alive until vault_lock.
+    });
 }
 
 #[tauri::command]
 pub async fn vault_lock(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<()> {
+    // Tear down the I2P transport first — the queue worker (when wired
+    // in Phase 6.5) needs the DB still open while it shuts down. Take
+    // the runtime out of the slot under the async lock, then await its
+    // graceful shutdown without holding any locks.
+    let i2p_runtime = {
+        let mut slot = state.i2p.lock().await;
+        slot.take()
+    };
+    if let Some(rt) = i2p_runtime {
+        if let Ok(rt_owned) = std::sync::Arc::try_unwrap(rt) {
+            crate::transport::i2p::lifecycle::stop(rt_owned).await;
+        } else {
+            tracing::warn!(
+                "i2p: runtime Arc has live references at vault_lock; \
+                 i2pd will be reaped on Drop"
+            );
+        }
+    }
+
     let mut guard = state.vault.lock();
     if let Some(rt) = guard.take() {
         rt.db.close();

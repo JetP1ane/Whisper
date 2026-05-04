@@ -80,9 +80,10 @@ async fn mint_and_store_destination_round_trips_through_sqlite() {
         .expect("seed identity");
 
     // Mint via SAM — this is the actual i2pd round trip.
+    let db_mu = parking_lot::Mutex::new(db);
     let minted = timeout(
         Duration::from_secs(20),
-        destination::mint_and_store(&db, &addr),
+        destination::mint_and_store(&db_mu, &addr),
     )
     .await
     .expect("mint timeout")
@@ -91,7 +92,10 @@ async fn mint_and_store_destination_round_trips_through_sqlite() {
     assert!(minted.priv_b64.len() > 800, "PRIV suspiciously short: {}", minted.priv_b64.len());
 
     // Read it back from the row — round trip without any network.
-    let loaded = destination::load(&db).unwrap().expect("destination present");
+    let loaded = {
+        let g = db_mu.lock();
+        destination::load(&g).unwrap().expect("destination present")
+    };
     assert_eq!(loaded.pub_b64, minted.pub_b64);
     assert_eq!(loaded.priv_b64, minted.priv_b64);
 
@@ -100,7 +104,7 @@ async fn mint_and_store_destination_round_trips_through_sqlite() {
     // tried to hit the network it would error out).
     let cached = timeout(
         Duration::from_secs(2),
-        destination::load_or_mint(&db, "127.0.0.1:1"),
+        destination::load_or_mint(&db_mu, "127.0.0.1:1"),
     )
     .await
     .expect("load_or_mint timeout")

@@ -158,60 +158,113 @@ pub fn record_attempt(db: &Database, queue_id: &str) -> DbResult<()> {
     Ok(())
 }
 
-/// One pass of the queue worker. Walks all queued rows and either
-/// (a) tries to deliver them via `conn`, (b) skips if still inside the
-/// backoff window, or (c) expires them if past the TTL. Returns the
-/// number of rows that were marked delivered this pass.
-pub async fn process_once(
-    db: &Database,
-    conn: &ConnectionManager,
-) -> I2pResult<usize> {
-    let now = now_unix_ms();
-    let pending = list_queued(db).map_err(|e| {
-        super::I2pError::Sam(format!("list_queued: {e}"))
-    })?;
-    let mut delivered = 0;
+/// Outcome of a single send attempt by the worker. Returned by the
+/// async send half (`try_send`) so the sync record-keeping half
+/// (`record_outcome`) can update the DB without holding a reference
+/// across the await.
+#[derive(Debug, Clone, Copy)]
+enum Attempt {
+    Delivered,
+    Failed,
+}
+
+/// Sync half: peek at the queue under the DB lock, decide which rows
+/// are due (by age + backoff), expire any past their TTL, and return
+/// the rows to attempt this tick. The DB lock is dropped before the
+/// caller does any await — that's the whole point of the split.
+fn take_due_rows(db: &Database, now_ms: i64) -> Vec<QueuedSend> {
+    let pending = match list_queued(db) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("i2p: list_queued failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut due = Vec::new();
     for row in pending {
-        // TTL expiry — give up.
-        if (now - row.created_at) / 1000 > QUEUE_TTL_SECS {
+        if (now_ms - row.created_at) / 1000 > QUEUE_TTL_SECS {
             let _ = mark_expired(db, &row.id, &row.message_id);
             tracing::warn!(
                 "i2p: send queue row {} expired after {}d",
                 row.id,
-                (now - row.created_at) / 1000 / 86400
+                (now_ms - row.created_at) / 1000 / 86400
             );
             continue;
         }
-        // Backoff: skip if not enough time has passed since the last try.
         if let Some(last) = row.last_attempt_at {
-            let waited = Duration::from_millis((now - last) as u64);
+            let waited = Duration::from_millis((now_ms - last) as u64);
             let needed = backoff_for_attempt(row.attempt_count);
             if waited < needed {
                 continue;
             }
         }
-        let kind = FrameType::from_code(row.frame_kind);
-        let res = conn
-            .send_blob(&row.contact_destination, kind, &row.encrypted_blob)
-            .await;
-        match res {
-            Ok(()) => {
-                let _ = mark_delivered(db, &row.id, &row.message_id);
-                delivered += 1;
-                tracing::info!(
-                    "i2p: delivered queued message {} to {}",
-                    row.message_id,
-                    &row.contact_destination[..16.min(row.contact_destination.len())]
-                );
-            }
-            Err(e) => {
-                let _ = record_attempt(db, &row.id);
-                tracing::debug!(
-                    "i2p: send attempt {} for {} failed: {e}",
-                    row.attempt_count + 1,
-                    row.message_id
-                );
-            }
+        due.push(row);
+    }
+    due
+}
+
+/// Async half: actually issue the send. Holds no DB reference.
+async fn try_send(conn: &ConnectionManager, row: &QueuedSend) -> Attempt {
+    let kind = FrameType::from_code(row.frame_kind);
+    match conn
+        .send_blob(&row.contact_destination, kind, &row.encrypted_blob)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(
+                "i2p: delivered queued message {} to {}",
+                row.message_id,
+                &row.contact_destination[..16.min(row.contact_destination.len())]
+            );
+            Attempt::Delivered
+        }
+        Err(e) => {
+            tracing::debug!(
+                "i2p: send attempt {} for {} failed: {e}",
+                row.attempt_count + 1,
+                row.message_id
+            );
+            Attempt::Failed
+        }
+    }
+}
+
+/// Sync half: write back the outcome. Re-acquires the DB lock.
+fn record_outcome(db: &Database, row: &QueuedSend, outcome: Attempt) {
+    match outcome {
+        Attempt::Delivered => {
+            let _ = mark_delivered(db, &row.id, &row.message_id);
+        }
+        Attempt::Failed => {
+            let _ = record_attempt(db, &row.id);
+        }
+    }
+}
+
+/// One pass of the queue worker — useful for tests that drive a single
+/// tick without spawning the long-running worker. Returns the number of
+/// rows that were marked delivered this pass.
+pub async fn process_once(
+    db_holder: &parking_lot::Mutex<Option<Database>>,
+    conn: &ConnectionManager,
+) -> I2pResult<usize> {
+    let now = now_unix_ms();
+    let due = {
+        let guard = db_holder.lock();
+        match guard.as_ref() {
+            Some(db) => take_due_rows(db, now),
+            None => Vec::new(),
+        }
+    };
+    let mut delivered = 0;
+    for row in due {
+        let outcome = try_send(conn, &row).await;
+        if matches!(outcome, Attempt::Delivered) {
+            delivered += 1;
+        }
+        let guard = db_holder.lock();
+        if let Some(db) = guard.as_ref() {
+            record_outcome(db, &row, outcome);
         }
     }
     Ok(delivered)
@@ -220,8 +273,9 @@ pub async fn process_once(
 /// Long-running worker: process the queue on a fixed cadence. Cancelled
 /// when the owning `JoinHandle` is dropped (or via `abort()`).
 ///
-/// The cadence here is the *outer* loop — the per-row backoff above
-/// gates whether each individual row is actually retried on this tick.
+/// The cadence here is the *outer* loop — the per-row backoff inside
+/// `take_due_rows` gates whether each individual row is actually
+/// retried on this tick.
 pub async fn run_worker(
     db: Arc<parking_lot::Mutex<Option<Database>>>,
     conn: Arc<ConnectionManager>,
@@ -229,16 +283,7 @@ pub async fn run_worker(
     let tick = Duration::from_secs(5);
     loop {
         tokio::time::sleep(tick).await;
-        let res = {
-            let guard = db.lock();
-            match guard.as_ref() {
-                Some(d) => process_once(d, &conn).await,
-                None => Ok(0), // vault locked; skip this tick
-            }
-        };
-        if let Err(e) = res {
-            tracing::warn!("i2p: queue worker error: {e}");
-        }
+        let _ = process_once(&db, &conn).await;
     }
 }
 

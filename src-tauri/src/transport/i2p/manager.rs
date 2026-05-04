@@ -168,13 +168,24 @@ pub struct I2PManager {
     _control: BufReader<TcpStream>,
     /// Our persisted destination (pub + priv, base64).
     destination: PersistedDestination,
+    /// Owned secondary DB connection for the queue worker (Phase 6.5).
+    /// Wrapped in a `parking_lot::Mutex` so the surrounding I2PManager
+    /// is `Sync` (rusqlite Connection is Send-but-not-Sync). The queue
+    /// worker locks this synchronously to read pending sends + record
+    /// outcomes; nothing across `.await` needs to touch it.
+    pub(crate) db: parking_lot::Mutex<Database>,
 }
 
 impl I2PManager {
     /// Spawn i2pd, wait for SAM readiness, mint+load the destination,
     /// and create the master STREAM session. Resolves once everything is
     /// ready or returns the first failure.
-    pub async fn start(db: &Database, cfg: I2pConfig) -> I2pResult<Self> {
+    ///
+    /// Takes owned `Database` (a secondary SQLCipher connection — see
+    /// `commands::spawn_i2p_start`) so the start future is `Send`.
+    /// Connection is Send-but-not-Sync, so owning it in a future works
+    /// where `&Database` would not.
+    pub async fn start(db: Database, cfg: I2pConfig) -> I2pResult<Self> {
         let bin = locate_i2pd_binary()?;
         tracing::info!("i2p: using binary {}", bin.display());
 
@@ -251,9 +262,11 @@ impl I2PManager {
         }
         tracing::info!("i2p: SAM ready at {sam_addr}");
 
-        // Mint or load the persistent destination, then stand up the
-        // master STREAM session.
-        let destination = destination::load_or_mint(db, &sam_addr).await?;
+        // Wrap the owned DB in a Mutex so the destination calls can
+        // hold a `&Mutex<Database>` (Sync) across their `.await`s.
+        // After this point we own the Mutex and pass it through.
+        let db = parking_lot::Mutex::new(db);
+        let destination = destination::load_or_mint(&db, &sam_addr).await?;
         tracing::info!(
             "i2p: destination ready (pub={} chars, priv={} chars)",
             destination.pub_b64.len(),
@@ -279,6 +292,7 @@ impl I2PManager {
             session_id,
             _control: control,
             destination,
+            db,
         })
     }
 

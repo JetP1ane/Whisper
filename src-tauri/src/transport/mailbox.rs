@@ -11,6 +11,12 @@
 use rand::RngCore;
 
 pub const MAILBOX_LEN: usize = 16;
+
+/// Length of the ASCII-hex mailbox prefix prepended to each relay-format
+/// blob (32 hex chars = 16 mailbox bytes). The I2P transport strips this
+/// prefix because destination routing replaces mailbox addressing.
+pub const MAILBOX_PREFIX_LEN: usize = 32;
+
 const MS_PER_DAY: u64 = 86_400_000;
 
 pub fn epoch_day(unix_ms: u64) -> u64 {
