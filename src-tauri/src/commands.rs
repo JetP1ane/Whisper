@@ -1714,77 +1714,21 @@ pub async fn message_send_detonating(
     // detonation is enforced by the AEAD-embedded TTL on both clients.
     let relay_ttl = (detonate_secs as u64).min(60 * 60 * 24);
 
-    if try_i2p_deliver(
-        &state,
-        &contact,
-        crate::transport::i2p::framing::FrameType::Message,
-        &prepared.blob,
-    )
-    .await?
-    {
-        {
-            let guard = state.vault.lock();
-            let rt = guard.as_ref().ok_or("vault locked")?;
-            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
-            let _ = rt
-                .db
-                .set_message_delivery_transport(&prepared.msg_id, "i2p");
-        }
-        emit_message_status_sent(&app, &prepared.msg_id);
-        return Ok(prepared.message.id);
-    }
-
-    // I2P-only mode: no relay fallback. Mark the row failed and bail
-    // so the user can see the I2P transport is genuinely the only path.
-    if is_i2p_only(&state) {
-        let guard = state.vault.lock();
-        if let Some(rt) = guard.as_ref() {
-            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
-        }
-        return Err("i2p-only mode: I2P delivery failed and relay fallback is disabled".into());
-    }
-
-    match prepared.target_relay_url.as_deref() {
-        Some(target) => {
-            tracing::info!(
-                "message_send_detonating: cross-relay deposit to {} for {} (ttl={}s)",
-                target,
-                contact.alias,
-                relay_ttl
-            );
-            let pin = lookup_relay_pin(&state, target);
-            let result = crate::transport::relay::transient_deposit(
-                target,
-                &prepared.mailbox_hex,
-                &prepared.blob,
-                relay_ttl,
-                std::time::Duration::from_secs(10),
-                pin,
-            )
-            .await;
-            record_transient_deposit(&state, target, &result);
-            let captured = result.map_err(err)?;
-            persist_relay_pin_if_new(&state, target, pin, captured);
-            {
-                let guard = state.vault.lock();
-                let rt = guard.as_ref().ok_or("vault locked")?;
-                let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
-                let _ = rt
-                    .db
-                    .set_message_delivery_transport(&prepared.msg_id, "relay");
-            }
-            emit_message_status_sent(&app, &prepared.msg_id);
-        }
-        None => {
-            stamp_transport(&state, &prepared.msg_id, "relay");
-            let _ = state.relay.deposit(
-                prepared.mailbox_hex.clone(),
-                &prepared.blob,
-                relay_ttl,
-                prepared.msg_id.clone(),
-            );
-        }
-    }
+    // Fire-and-forget dispatch — same shape as `message_send`.
+    let state_clone = std::sync::Arc::clone(&state);
+    let app_clone = app.clone();
+    let contact_clone = contact.clone();
+    let prepared_for_task = PreparedDispatch {
+        msg_id: prepared.msg_id.clone(),
+        mailbox_hex: prepared.mailbox_hex.clone(),
+        blob: prepared.blob.clone(),
+        target_relay_url: prepared.target_relay_url.clone(),
+        relay_ttl,
+        frame_kind: crate::transport::i2p::framing::FrameType::Message,
+    };
+    tokio::spawn(async move {
+        dispatch_outbound(state_clone, app_clone, contact_clone, prepared_for_task).await;
+    });
 
     Ok(prepared.message.id)
 }
@@ -2302,72 +2246,26 @@ pub async fn message_send_attachment(
         tracing::warn!("attachment_store (sender side) failed: {e}");
     }
 
-    // I2P attempt — note attachments use the FileMetadata frame type
-    // here (the inline-bytes shape that fits inside one frame).
-    // Phase 7 will add the streaming chunked path for larger files.
-    if try_i2p_deliver(
-        &state,
-        &contact,
-        crate::transport::i2p::framing::FrameType::FileMetadata,
-        &prepared.blob,
-    )
-    .await?
-    {
-        {
-            let guard = state.vault.lock();
-            let rt = guard.as_ref().ok_or("vault locked")?;
-            let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
-            let _ = rt
-                .db
-                .set_message_delivery_transport(&prepared.msg_id, "i2p");
-        }
-        emit_message_status_sent(&app, &prepared.msg_id);
-        return Ok(prepared.message.id);
-    }
+    // Fire-and-forget dispatch — same shape as `message_send`. The
+    // local at-rest copy is already on disk (above) so the bubble
+    // can render the file preview as soon as we return. Attachments
+    // use FrameType::FileMetadata so the inbound side knows this is
+    // a single-frame inline file (vs the streaming FileChunk path).
+    let state_clone = std::sync::Arc::clone(&state);
+    let app_clone = app.clone();
+    let contact_clone = contact.clone();
+    let prepared_for_task = PreparedDispatch {
+        msg_id: prepared.msg_id.clone(),
+        mailbox_hex: prepared.mailbox_hex.clone(),
+        blob: prepared.blob.clone(),
+        target_relay_url: prepared.target_relay_url.clone(),
+        relay_ttl: 60 * 60 * 24,
+        frame_kind: crate::transport::i2p::framing::FrameType::FileMetadata,
+    };
+    tokio::spawn(async move {
+        dispatch_outbound(state_clone, app_clone, contact_clone, prepared_for_task).await;
+    });
 
-    if is_i2p_only(&state) {
-        let guard = state.vault.lock();
-        if let Some(rt) = guard.as_ref() {
-            let _ = rt.db.set_message_status(&prepared.msg_id, "failed");
-        }
-        return Err("i2p-only mode: I2P delivery failed and relay fallback is disabled".into());
-    }
-
-    match prepared.target_relay_url.as_deref() {
-        Some(target) => {
-            let pin = lookup_relay_pin(&state, target);
-            let result = crate::transport::relay::transient_deposit(
-                target,
-                &prepared.mailbox_hex,
-                &prepared.blob,
-                60 * 60 * 24,
-                std::time::Duration::from_secs(15),
-                pin,
-            )
-            .await;
-            record_transient_deposit(&state, target, &result);
-            let captured = result.map_err(err)?;
-            persist_relay_pin_if_new(&state, target, pin, captured);
-            {
-                let guard = state.vault.lock();
-                let rt = guard.as_ref().ok_or("vault locked")?;
-                let _ = rt.db.set_message_status(&prepared.msg_id, "sent");
-                let _ = rt
-                    .db
-                    .set_message_delivery_transport(&prepared.msg_id, "relay");
-            }
-            emit_message_status_sent(&app, &prepared.msg_id);
-        }
-        None => {
-            stamp_transport(&state, &prepared.msg_id, "relay");
-            let _ = state.relay.deposit(
-                prepared.mailbox_hex.clone(),
-                &prepared.blob,
-                60 * 60 * 24,
-                prepared.msg_id.clone(),
-            );
-        }
-    }
     Ok(prepared.message.id)
 }
 
