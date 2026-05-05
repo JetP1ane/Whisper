@@ -43,6 +43,16 @@ pub struct PersistedDestination {
 /// Read the stored destination, if any. Returns `Ok(None)` when the
 /// identity row exists but the i2p columns are still NULL (i.e. we
 /// haven't minted yet — first run after the I2P migration).
+///
+/// Defensive trim on read: an earlier version of our SAM `parse_reply`
+/// occasionally captured a trailing newline or carriage return into
+/// the PRIV value, which then got persisted in the BLOB column. When
+/// that polluted value is later spliced into a SESSION CREATE command
+/// line (`DESTINATION=<b64>\n SIGNATURE_TYPE=...`), i2pd's parser
+/// sees the embedded whitespace, treats it as a line terminator, and
+/// rejects the rest as a malformed second command — closing the SAM
+/// socket. Trimming both fields here heals legacy bad rows on first
+/// load without forcing a destination rotation.
 pub fn load(db: &Database) -> DbResult<Option<PersistedDestination>> {
     let mut stmt = db.conn.prepare(
         "SELECT i2p_dest_pub, i2p_dest_priv FROM identity WHERE id = 'self' LIMIT 1",
@@ -63,10 +73,21 @@ pub fn load(db: &Database) -> DbResult<Option<PersistedDestination>> {
                         Box::new(e),
                     ))
                 })?;
-            Ok(Some(PersistedDestination { pub_b64: p, priv_b64 }))
+            // Trim ANY whitespace (including embedded \r or \n that
+            // shouldn't be there but might be from a legacy mint).
+            let pub_b64 = strip_all_whitespace(&p);
+            let priv_b64 = strip_all_whitespace(&priv_b64);
+            if pub_b64.is_empty() || priv_b64.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(PersistedDestination { pub_b64, priv_b64 }))
         }
         _ => Ok(None),
     }
+}
+
+fn strip_all_whitespace(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Persist (or replace) the destination on the `self` identity row.

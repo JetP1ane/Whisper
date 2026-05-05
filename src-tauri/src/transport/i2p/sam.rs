@@ -255,6 +255,23 @@ pub async fn session_create_stream<RW>(
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
+    // Defensive: any embedded whitespace in the destination would
+    // truncate the SESSION CREATE line on the SAM bridge side and
+    // cause "Malformed message" + a socket close. We trim on read in
+    // `destination::load` already, but fail fast here too so a future
+    // regression is loud.
+    if dest_priv != "TRANSIENT"
+        && dest_priv.chars().any(|c| c.is_whitespace())
+    {
+        return Err(I2pError::InvalidDestination(
+            "destination contains whitespace; SAM line would be truncated".into(),
+        ));
+    }
+    if session_id.chars().any(|c| c.is_whitespace()) {
+        return Err(I2pError::Sam(
+            "session_id contains whitespace".into(),
+        ));
+    }
     let mut cmd = format!(
         "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION={dest_priv}"
     );
