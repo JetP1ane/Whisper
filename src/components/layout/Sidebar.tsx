@@ -131,35 +131,77 @@ function SectionHeader({
 }
 
 function IdentityCard({ identity }: { identity: IdentitySummary }) {
-  const [copied, setCopied] = useState(false);
-  const onCopy = async () => {
+  const [copied, setCopied] = useState<"alias" | "invite" | null>(null);
+
+  const copyAlias = async () => {
     try {
       await navigator.clipboard.writeText(identity.alias);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
+      setCopied("alias");
+      setTimeout(() => setCopied(null), 1200);
     } catch {
       /* ignore */
     }
   };
+
+  const copyInvite = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const link = await invoke<string>("identity_invite_link");
+      await navigator.clipboard.writeText(link);
+      setCopied("invite");
+      setTimeout(() => setCopied(null), 1500);
+    } catch {
+      /* ignore */
+    }
+  };
+
   return (
-    <button
-      onClick={onCopy}
-      title="Click to copy your Whisper ID"
-      className="w-full text-left px-2 py-1.5 rounded-md bg-bg-inset hover:bg-bg-hover transition-colors"
-    >
+    <div className="w-full px-2 py-1.5 rounded-md bg-bg-inset">
       <div className="flex items-center justify-between">
         <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
           You
         </span>
-        <span className="text-[10px] font-mono uppercase tracking-wider text-accent-400 transition-opacity"
-              style={{ opacity: copied ? 1 : 0 }}>
-          copied
+        <span
+          className="text-[10px] font-mono uppercase tracking-wider text-accent-400 transition-opacity"
+          style={{ opacity: copied !== null ? 1 : 0 }}
+        >
+          {copied === "invite" ? "invite copied" : copied === "alias" ? "id copied" : "copied"}
         </span>
       </div>
-      <div className="font-mono text-xs text-text-primary truncate">
+      <button
+        onClick={copyAlias}
+        title="Click to copy your three-word Whisper ID"
+        className="block w-full text-left font-mono text-xs text-text-primary truncate hover:text-accent-400 transition-colors"
+      >
         {identity.alias}
-      </div>
-    </button>
+      </button>
+      <button
+        onClick={copyInvite}
+        title="Copy your whisper:// invite link to share with someone who wants to add you"
+        className="mt-1.5 w-full px-2 py-1 rounded-md bg-accent-500/15 hover:bg-accent-500/25 border border-accent-500/30 transition-colors text-[11px] font-mono text-accent-400 flex items-center justify-center gap-1"
+      >
+        <ShareIcon /> share invite link
+      </button>
+    </div>
+  );
+}
+
+function ShareIcon() {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" />
+      <polyline points="16 6 12 2 8 6" />
+      <line x1="12" y1="2" x2="12" y2="15" />
+    </svg>
   );
 }
 
