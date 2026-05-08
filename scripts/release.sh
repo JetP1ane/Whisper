@@ -40,12 +40,23 @@ fi
 VERSION=$(node -p "require('$REPO_ROOT/src-tauri/tauri.conf.json').version")
 echo "==> Version: $VERSION"
 
-# --- 2. Build (this calls bundle-i2pd.sh and then tauri build) ---
+# --- 2. Clean stale bundler artifacts before building ---
+# Tauri's bundle_dmg.sh leaves a half-finished `rw.<pid>.<name>.dmg`
+# behind in the macos/ bundle dir if a prior run was aborted (e.g.
+# during the AppleScript "make Finder pretty" step). On the next run
+# the leftover file confuses the AppleScript stage and the whole
+# bundle step fails with a vague "failed to run bundle_dmg.sh".
+# Purging the rw scratch + any prior final dmg is cheap and removes
+# this footgun.
+BUNDLE_DIR="$REPO_ROOT/src-tauri/target/release/bundle"
+rm -f "$BUNDLE_DIR/macos/"rw.*.dmg "$BUNDLE_DIR/dmg/"*.dmg 2>/dev/null || true
+
+# --- 3. Build (this calls bundle-i2pd.sh and then tauri build) ---
 echo "==> Running npm run tauri:build (this includes the i2pd bundle step)..."
 cd "$REPO_ROOT"
 npm run tauri:build
 
-# --- 3. Find the produced .dmg ---
+# --- 4. Find the produced .dmg ---
 DMG_DIR="$REPO_ROOT/src-tauri/target/release/bundle/dmg"
 DMG=""
 for candidate in "$DMG_DIR"/*.dmg; do
@@ -61,11 +72,11 @@ fi
 DMG_NAME="$(basename "$DMG")"
 echo "==> Built: $DMG_NAME"
 
-# --- 4. SHA-256 ---
+# --- 5. SHA-256 ---
 SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
 echo "==> SHA-256: $SHA256"
 
-# --- 5. Detect arch from filename for the right cask slot ---
+# --- 6. Detect arch from filename for the right cask slot ---
 case "$DMG_NAME" in
   *aarch64*|*arm64*) ARCH=arm ;;
   *x64*|*x86_64*)    ARCH=intel ;;
@@ -73,7 +84,7 @@ case "$DMG_NAME" in
 esac
 echo "==> Architecture: $ARCH"
 
-# --- 6. Generate populated cask file ---
+# --- 7. Generate populated cask file ---
 mkdir -p "$DIST"
 CASK="$DIST/noctis-whisper.rb"
 cp "$TEMPLATE" "$CASK"
@@ -96,7 +107,7 @@ case "$ARCH" in
 esac
 rm -f "$CASK.bak"
 
-# --- 7. Stage the dmg under a canonical, brew-friendly filename ---
+# --- 8. Stage the dmg under a canonical, brew-friendly filename ---
 # Tauri sometimes emits filenames with spaces ("Noctis Whisper_..."),
 # which gets percent-encoded in URLs and is awkward in scripts. Rename
 # to underscores so the cask's URL pattern matches deterministically.
@@ -109,7 +120,7 @@ CANONICAL_NAME="Noctis_Whisper_${VERSION}_${ARCH_TAG}.dmg"
 cp "$DMG" "$DIST/$CANONICAL_NAME"
 echo "==> Staged: dist/$CANONICAL_NAME"
 
-# --- 8. Next-steps banner ---
+# --- 9. Next-steps banner ---
 cat <<EOF
 
 ==============================================================
