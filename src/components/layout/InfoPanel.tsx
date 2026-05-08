@@ -159,7 +159,7 @@ export function InfoPanel() {
             </li>
             <li className="flex gap-1.5">
               <span className="text-status-ok">✓</span>
-              <span>App sandbox active. JIT, debugger attach, and <span className="font-mono">DYLD_*</span> env vars all denied at the entitlement level.</span>
+              <span>Hardened Runtime enforced: JIT, debugger attach, and <span className="font-mono">DYLD_*</span> env vars all denied at the OS level. App Sandbox is configured and activates once the binary is Developer-ID-signed + notarized.</span>
             </li>
             <li className="flex gap-1.5">
               <span className="text-status-ok">✓</span>

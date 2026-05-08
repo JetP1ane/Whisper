@@ -5,9 +5,9 @@
 #      and writes a populated copy of this file to dist/noctis-whisper.rb.
 #   2. Copy dist/noctis-whisper.rb into your homebrew tap repo at
 #      Casks/noctis-whisper.rb, commit, and push.
-#   3. Users install with:
-#        brew tap <YOUR_GH_USER>/noctis-whisper
-#        brew install --cask noctis-whisper
+#   3. Users install with one command — brew auto-taps on the
+#      fully-qualified cask reference:
+#        brew install --cask <YOUR_GH_USER>/noctis-whisper/noctis-whisper
 #
 # Why this works without an Apple Developer ID: brew cask installs strip
 # the com.apple.quarantine extended attribute, so Gatekeeper never sees

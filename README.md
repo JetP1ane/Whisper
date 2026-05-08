@@ -1,5 +1,9 @@
 # Noctis Whisper
 
+<p align="center">
+  <img src="public/readmeimage01.png" alt="Noctis Whisper" width="720" />
+</p>
+
 A private, post-quantum, peer-to-peer messenger for macOS.
 
 No central server, no operator-run relay. The transport is I2P, so peers
@@ -14,6 +18,22 @@ opened without the original Mac's Keychain.
 For the architecture and the threat model, see
 [`WHITEPAPER.md`](WHITEPAPER.md). For the high-level version, see
 [`LITEPAPER.md`](LITEPAPER.md).
+
+## Install
+
+Apple Silicon Macs running macOS 12+. Single command — Homebrew will
+auto-tap on the fully-qualified cask reference:
+
+```sh
+brew install --cask jetp1ane/noctis-whisper/noctis-whisper
+```
+
+Brew strips macOS's quarantine attribute on cask installs, so this
+sidesteps the "unidentified developer" Gatekeeper warning that
+direct-`.dmg` downloads currently trigger (Apple Developer ID +
+notarization is in flight; the shorter `brew install --cask
+noctis-whisper` form lands once submission to homebrew/homebrew-cask
+clears).
 
 ## Status
 
@@ -164,12 +184,16 @@ See [`docs/HOMEBREW.md`](docs/HOMEBREW.md). Per release:
 ```
 
 Outputs a built `.dmg` and a populated `homebrew/noctis-whisper.rb`
-ready to commit into your tap repo. Users install with:
+ready to commit into your tap repo. Users install with one command —
+brew auto-taps from the fully-qualified cask reference:
 
 ```sh
-brew tap JetP1ane/noctis-whisper
-brew install --cask noctis-whisper
+brew install --cask jetp1ane/noctis-whisper/noctis-whisper
 ```
+
+(The shorter `brew install --cask noctis-whisper` form will work after
+submission to homebrew/homebrew-cask, which requires Developer ID +
+notarization first.)
 
 ## Security disclosure
 

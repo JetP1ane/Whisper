@@ -140,9 +140,9 @@ Next steps:
   4. Commit the cask file into your homebrew tap repo at
      Casks/noctis-whisper.rb, then push.
 
-  5. Users install with:
-       brew tap <your-gh-user>/noctis-whisper
-       brew install --cask noctis-whisper
+  5. Users install with one command (brew auto-taps from the
+     fully-qualified cask reference):
+       brew install --cask <your-gh-user>/noctis-whisper/noctis-whisper
 
   Note: the second arch (the one not built on this machine) still has
   REPLACE_WITH_*_SHA256 in the cask. To support both arm64 and x86_64

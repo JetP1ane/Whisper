@@ -33,12 +33,16 @@ You need two GitHub repos:
 3. In repo (2), create a `Casks/` directory. You'll commit the
    generated cask file there for each release.
 
-4. Tell users how to install:
+4. Tell users how to install. The fully-qualified cask reference
+   makes brew auto-tap, so it's a single command:
 
    ```
-   brew tap <your-gh-user>/noctis-whisper
-   brew install --cask noctis-whisper
+   brew install --cask <your-gh-user>/noctis-whisper/noctis-whisper
    ```
+
+   Once you've submitted the cask to homebrew/homebrew-cask (after
+   Developer ID + notarization), the same install works without the
+   tap prefix as `brew install --cask noctis-whisper`.
 
 ## Per-release flow
 
