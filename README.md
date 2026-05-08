@@ -1,89 +1,181 @@
-# Noctis Whisper Desktop
+# Noctis Whisper
 
-Tauri v2 desktop client for the Noctis Whisper private messenger. Wire-compatible
-with the Android client — same PQ-X3DH key exchange, Double Ratchet, padded wire
-format, and BLAKE2b mailbox addressing.
+A private, post-quantum, peer-to-peer messenger for macOS.
 
-## Relay
+No central server, no operator-run relay. The transport is I2P, so peers
+connect directly to each other through anonymous garlic-routed tunnels.
+Cryptography is hybrid post-quantum — every session is protected by both
+classical X25519 and ML-KEM-1024, so an attacker has to break both legs
+to recover a key. Local storage is SQLCipher anchored to a hardware-bound
+seed in the macOS Keychain (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
+non-syncable). A clone of the database file on another machine cannot be
+opened without the original Mac's Keychain.
 
-This client speaks to the existing **`whisper-relay`** Go server (in
-`~/Documents/whisper-relay`) — same one the Android app uses. No relay changes
-are needed for desktop. The wire protocol the desktop client emits is
-verified against the relay's exact JSON tags by unit tests in
-`transport/control_messages.rs`:
+For the architecture and the threat model, see
+[`WHITEPAPER.md`](WHITEPAPER.md). For the elevator-pitch version, see
+[`LITEPAPER.md`](LITEPAPER.md).
 
-- type tags: `deposit`, `retrieve`, `delivery`, `deposited`, `notify`,
-  `padding`, `error`, `accounting_request`, `accounting_response`
-- accounting field names are **camelCase** (`framesSent`,
-  `framesReceivedFromClient`, …)
-- retrieve batch is exactly 8 mailboxes (2 real + 6 decoy, shuffled)
-- deposit blobs ≤ 10.5 MB, TTL ≤ 48 h, mailbox is 32-char lowercase hex
+## Status
 
-For local end-to-end testing, run the relay in dev mode:
+**v0.1.0** — closed-beta-ready via Homebrew Cask.
 
-```sh
-cd ~/Documents/whisper-relay
-go run ./cmd/relay -dev -dev-addr :8080
-```
+Three rounds of external security audit closed. Audit ledger:
 
-Then point the desktop client at `ws://127.0.0.1:8080/ws` in Settings → Relay.
+- All Critical findings remediated, with regression tests.
+- All High findings remediated except **HIGH-7** (Apple Developer ID +
+  notarization), which is procurement-gated.
+- Selected Mediums remediated (M-1, M-8, M-9, M-12, M-14, M-15, M-19,
+  M-20). Remaining Mediums are defense-in-depth and tracked for
+  post-v1 cycles. None are exploit-grade in the current threat model.
+
+Empirical confirmations from the dynamic pass (verified against the
+shipping binary, not just the source):
+
+- Frida and `lldb` attach are denied by macOS hardened-runtime policy
+  even under ad-hoc signing.
+- Tampered dylibs in the bundled `i2pd-bundle/` are blocked at load
+  by `dyld`'s code-directory hash check.
+- The 27-file SHA-256 manifest of the i2pd subprocess + dylibs +
+  reseed certs is verified at every spawn (NEW-3).
+- Pre-unlock egress is zero — i2pd does not start until the user
+  unlocks the vault.
+
+Distribution: ad-hoc + hardened-runtime signed, distributed via
+Homebrew Cask (which strips the macOS quarantine attribute, sidestepping
+the "unidentified developer" Gatekeeper warning). The transition to
+notarized direct-`.dmg` distribution depends on Developer ID
+procurement.
 
 ## Stack
 
-- **Backend:** Rust (Tauri v2) — crypto, transport, SQLCipher, Secure Enclave glue
-- **Frontend:** React + TypeScript + Tailwind, single window, dark-only
-- **Database:** SQLCipher via `rusqlite` with `bundled-sqlcipher`
+- **Backend:** Rust (Tauri v2) — crypto, I2P transport, SQLCipher, macOS
+  Keychain glue
+- **Frontend:** React + TypeScript + Tailwind, single window, dark/light
+- **Database:** SQLCipher 4 via `rusqlite` with `bundled-sqlcipher`
 - **Crypto:**
   - X25519 (`x25519-dalek`), Ed25519 (`ed25519-dalek`)
-  - ML-KEM-1024 (`pqcrypto-mlkem`) for post-quantum
-  - ChaCha20-Poly1305 (`chacha20poly1305`)
-  - HKDF-SHA256 (`hkdf` + `sha2`), BLAKE2b (`blake2`), Argon2id (`argon2`)
+  - ML-KEM-1024 (`pqcrypto-mlkem`) for hybrid post-quantum key exchange
+  - ChaCha20-Poly1305 (`chacha20poly1305`) AEAD
+  - HKDF-SHA256, BLAKE2b, Argon2id (256 MiB / 4 iter / 4 lanes)
   - All key buffers wrapped in `zeroize`
+- **Transport:** bundled `i2pd` subprocess on a randomized SAM port,
+  destination minted at first vault unlock and persisted in SQLCipher.
 
-## Layout
+## Project layout
 
 ```
 src-tauri/src/
-  crypto/        keys, vault, pqx3dh, ratchet, message_crypto, sealed,
-                 tee_encryption, secure_enclave, safety_numbers
-  transport/     mailbox, relay (WS), frame_accounting, control_messages
-  db/            schema, contacts, messages, rooms
-  state.rs       AppState (vault runtime + relay client)
-  commands.rs    Tauri IPC surface
+  crypto/         keys, vault, pqx3dh, ratchet, message_crypto,
+                  sender_key, sealed, secure_enclave, safety_numbers,
+                  config_manifest, bundle, seed
+  transport/
+    i2p/          manager (i2pd lifecycle), sam (SAM v3 client),
+                  connection, framing, queue, dispatch, lifecycle,
+                  destination, runtime
+    mailbox.rs    BLAKE2b mailbox addressing
+    envelopes.rs  signed-bundle wire format
+  messaging/      inbound, sender, receiver, ratchet_store, room_keys,
+                  attachments
+  db/             schema, contacts, messages, rooms, identity
+  security/       egress audit (lsof of own + i2pd subprocess)
+  identity.rs     identity load / persist
+  state.rs        AppState (vault runtime + i2p slots)
+  commands.rs     Tauri IPC surface
+  lib.rs          app entrypoint, tray, pre-warm task
+
+src-tauri/tests/
+  otpk_race.rs    M-12 OTPK zeroize + NEW-1 retransmission guards
+  parser_fuzz.rs  CRIT-1 parser fuzz (~85k inputs)
+  ...
+
 src/
-  components/    layout (Sidebar/ChatView/InfoPanel/TitleBar),
-                 chat, contacts, rooms, vault, settings, shared
-  hooks/         useCrypto, useKeyboard, useVault, useMessages, useWebSocket
-  stores/        appStore, conversationStore (Zustand)
+  components/     layout, chat, contacts, rooms, vault, settings, shared
+  hooks/          useCrypto, useKeyboard, useVault, useMessages
+  stores/         appStore, conversationStore (Zustand)
+
+scripts/
+  bundle-i2pd.sh  prepares src-tauri/i2pd-bundle/ from Homebrew i2pd
+  dev-dual.sh     launches two profile-isolated dev instances
+  wipe-profile.sh resets a profile to first-launch state
+  release.sh      builds + writes a populated Homebrew Cask file
+
+homebrew/
+  noctis-whisper.rb   source-of-truth Cask, copied into the tap repo
+                      per release
+
+docs/
+  HOMEBREW.md     one-time tap setup + per-release flow
+
+WHITEPAPER.md     architecture, threat model, cryptographic detail
+LITEPAPER.md     condensed pitch + diagrams
 ```
 
 ## Development
 
 ```sh
+brew install i2pd                      # required by scripts/bundle-i2pd.sh
 npm install
-npm run tauri:dev
+npm run tauri:dev                      # single instance (default profile)
+./scripts/dev-dual.sh                  # two instances (default + alice)
 ```
 
-Requires:
+Requirements:
 
 - Rust 1.77+ (`cargo`)
 - Node 22+ (`npm`)
 - Xcode Command Line Tools
+- Homebrew (for `i2pd`)
 
-## Open work
+The dual-instance script kills any prior Whisper / orphan i2pd
+processes, pre-builds the debug binary, and sequentially launches
+both instances so they don't race on `pick_free_port`.
 
-The scaffold ships protocol-level wire format, ratchet state, mailbox addressing,
-safety numbers, and the SQLCipher schema. The pieces still to be wired up before
-first launch:
+To reset a profile to first-launch state (testing onboarding /
+recovery-from-seed):
 
-- Persistence of the sealed DEK (Keychain item or sandboxed file)
-- Identity + prekey persistence on first run, served by `vault_setup`
-- `vault_unlock` end-to-end: Argon2id → DEK → Secure-Enclave → DB key → SQLCipher
-- Real Secure Enclave AES-CBC and HMAC-SHA256 calls
-  (`security-framework` `SecKeyCreateSignature` + `SecAccessControl`)
-- Bundle GET / PUT against the relay (`/bundle/{alias}` endpoint)
-- Ratchet wiring at the message layer (encrypt + deposit, retrieve + decrypt)
-- Frame accounting reconciliation alarm + dashboard surfacing
-- Sender-key group protocol for rooms
+```sh
+./scripts/wipe-profile.sh default     # one profile
+./scripts/wipe-profile.sh --all       # default + alice + bob
+```
 
-These are explicitly marked with `TODO` in the source.
+## Tests
+
+```sh
+cd src-tauri
+cargo test --lib                                           # 104 unit tests
+cargo test --test otpk_race                                # 3 integration
+cargo test --test parser_fuzz --release                    # 4 fuzz, ~85k inputs
+cargo test --lib --release                                 # 104 + tampering test
+```
+
+The release-only `verify_i2pd_pin_catches_dylib_tampering` test
+mutates a copy of the bundle and asserts the pin verification rejects
+both byte-tampered dylibs and tampered reseed certs by name.
+
+CI runs all of the above on every push and pull request — see
+`.github/workflows/ci.yml`.
+
+## Releasing
+
+See [`docs/HOMEBREW.md`](docs/HOMEBREW.md). Per release:
+
+```sh
+./scripts/release.sh
+```
+
+Outputs a built `.dmg` and a populated `homebrew/noctis-whisper.rb`
+ready to commit into your tap repo. Users install with:
+
+```sh
+brew tap JetP1ane/noctis-whisper
+brew install --cask noctis-whisper
+```
+
+## Security disclosure
+
+If you've found a vulnerability, please open a private security
+advisory on this repo rather than a public issue.
+
+## License
+
+TBD.
