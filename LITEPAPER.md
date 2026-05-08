@@ -1,4 +1,4 @@
-# Noctis Whisper - Lite Paper
+# Whisper by Noctis Privacy — Lite Paper
 
 A private, post-quantum, peer-to-peer messenger.
 *One-pass overview. The full architecture lives in [WHITEPAPER.md](WHITEPAPER.md).*

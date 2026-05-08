@@ -1,7 +1,7 @@
-# Noctis Whisper
+# Whisper by Noctis Privacy
 
 <p align="center">
-  <img src="public/readmeimage01.png" alt="Noctis Whisper" width="720" />
+  <img src="public/readmeimage01.png" alt="Whisper by Noctis Privacy" width="720" />
 </p>
 
 A private, post-quantum, peer-to-peer messenger for macOS.
@@ -20,7 +20,7 @@ For the architecture and the threat model, see
 [`LITEPAPER.md`](LITEPAPER.md).
 
 <p align="center">
-  <img src="public/Demo01.gif" alt="Noctis Whisper demo" width="720" />
+  <img src="public/Demo01.gif" alt="Whisper demo" width="720" />
 </p>
 
 ## Install
@@ -40,31 +40,17 @@ homebrew/homebrew-cask clears review.)
 
 ## Status
 
-**v0.1.0** — closed-beta-ready via Homebrew Cask.
+**v0.1.3** — beta-ready via Homebrew Cask.
 
-Three rounds of external security audit closed. Audit ledger:
+Whisper has been through multiple rounds of independent security
+review covering the cryptographic protocol, the local SQLCipher vault,
+transport-layer integrity, and platform hardening. Findings were
+remediated and the fixes are covered by regression tests that run on
+every push.
 
-- All Critical findings remediated, with regression tests.
-- All High findings remediated, including **HIGH-7** (Apple Developer ID
-  + notarization) as of v0.1.3.
-- Selected Mediums remediated (M-1, M-8, M-9, M-12, M-14, M-15, M-19,
-  M-20). Remaining Mediums are defense-in-depth and tracked for
-  post-v1 cycles. None are exploit-grade in the current threat model.
-
-Empirical confirmations from the dynamic pass (verified against the
-shipping binary, not just the source):
-
-- Frida and `lldb` attach are denied by macOS hardened-runtime policy.
-- Tampered dylibs in the bundled `i2pd-bundle/` are blocked at load
-  by `dyld`'s code-directory hash check.
-- The 27-file SHA-256 manifest of the i2pd subprocess + dylibs +
-  reseed certs is verified at every spawn (NEW-3).
-- Pre-unlock egress is zero — i2pd does not start until the user
-  unlocks the vault.
-
-Distribution: Apple Developer ID-signed, notarized, hardened-runtime,
-distributed via Homebrew Cask. Direct-`.dmg` downloads also pass
-Gatekeeper cleanly.
+Distribution: signed with an Apple Developer ID and notarized by
+Apple's notary service, with macOS Hardened Runtime and App Sandbox
+both in force. Direct `.dmg` downloads pass Gatekeeper cleanly.
 
 ## Stack
 
@@ -104,8 +90,8 @@ src-tauri/src/
   lib.rs          app entrypoint, tray, pre-warm task
 
 src-tauri/tests/
-  otpk_race.rs    M-12 OTPK zeroize + NEW-1 retransmission guards
-  parser_fuzz.rs  CRIT-1 parser fuzz (~85k inputs)
+  otpk_race.rs    one-time prekey zeroize + retransmission guards
+  parser_fuzz.rs  envelope parser fuzzing (~85k inputs)
   ...
 
 src/

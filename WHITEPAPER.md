@@ -1,4 +1,4 @@
-# Noctis Whisper
+# Whisper by Noctis Privacy
 
 A private, post-quantum, peer-to-peer messenger.
 
@@ -6,7 +6,7 @@ A private, post-quantum, peer-to-peer messenger.
 
 ## What it is
 
-Noctis Whisper is a desktop messenger with no central server, hybrid post-quantum end-to-end encryption, and on-device hardware-anchored key storage. It runs on the I2P overlay network: messages traverse a chain of intermediate routers between the two endpoints, so passive network observers see neither message contents nor - under typical conditions - the social graph that most messengers leak.
+Whisper is a desktop messenger with no central server, hybrid post-quantum end-to-end encryption, and on-device hardware-anchored key storage. It runs on the I2P overlay network: messages traverse a chain of intermediate routers between the two endpoints, so passive network observers see neither message contents nor - under typical conditions - the social graph that most messengers leak.
 
 This document is a description of the architecture, not a security proof. We separate cryptographic guarantees (provable from primitive assumptions and a correct implementation) from architectural properties (true by design, observable in code) from best-effort behaviors (depend on network conditions and resist most but not all adversaries). The boundaries are stated explicitly throughout.
 
