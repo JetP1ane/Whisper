@@ -16,19 +16,26 @@ export function ContactList() {
     <div className="flex flex-col px-1">
       {directs.map((c) => {
         const label = conversationLabel(c);
+        const isSelected = selectedId === c.id;
+        // Selected row always uses fixed-dark bg-gray-800 to mirror the
+        // receiver chat bubble, so the text inside must override the
+        // mode-aware text-* tokens (which resolve to near-black in
+        // light mode and would be invisible against the dark fill).
+        const labelClass = isSelected ? "text-white" : "text-text-primary";
+        const subClass = isSelected ? "text-white/60" : "text-text-tertiary";
         return (
         <button
           key={c.id}
           onClick={() => select(c.id)}
           className={`flex items-center gap-2 px-3 py-2 rounded-md text-left
-            ${selectedId === c.id ? "bg-gray-800" : "hover:bg-bg-hover"}`}
+            ${isSelected ? "bg-gray-800" : "hover:bg-bg-hover"}`}
         >
           <Avatar alias={label} />
           <div className="flex-1 min-w-0">
-            <div className="text-sm text-text-primary truncate font-mono">
+            <div className={`text-sm truncate font-mono ${labelClass}`}>
               {label}
             </div>
-            <div className="text-[11px] text-text-tertiary truncate">
+            <div className={`text-[11px] truncate ${subClass}`}>
               {c.last_message_at ? formatTime(c.last_message_at) : "no messages yet"}
             </div>
           </div>

@@ -67,7 +67,7 @@ function UnlockPanel({
         <div className="flex items-center gap-2 text-text-tertiary">
           <NoctisOwl size={40} />
           <span className="text-[10px] font-mono uppercase tracking-wider">
-            Vault
+            Whisper Vault
           </span>
         </div>
         <h1 className="text-lg text-text-primary mt-1 mb-4">Welcome back</h1>
