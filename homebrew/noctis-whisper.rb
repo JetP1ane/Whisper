@@ -15,11 +15,11 @@
 # runtime entitlements (which block debugger/Frida attach) still apply.
 
 cask "noctis-whisper" do
-  version "0.1.1"
+  version "0.1.2"
 
   # Apple Silicon-only for v0.1.0 — Intel build to follow.
   depends_on arch: :arm64
-  sha256 "6d3b9747882b75ab7ac905eea01cbeee95bb079521d56488896c755fb5bfb62b"
+  sha256 "bc25f734f50f04f6f1253a1709c5ce552d7ecc6d65aee83fbbbaaa08f1bf9fb8"
   url "https://github.com/JetP1ane/Whisper/releases/download/v#{version}/Noctis_Whisper_#{version}_aarch64.dmg"
 
   name "Noctis Whisper"
