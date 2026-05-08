@@ -1,4 +1,4 @@
-//! Noctis Whisper Desktop — library entry point.
+//! Whisper Desktop — library entry point.
 //!
 //! Wires the Tauri app, exposes IPC commands to the frontend, and owns the
 //! global runtime state (vault, transport, db).
@@ -201,7 +201,7 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error running Noctis Whisper");
+        .expect("error running Whisper");
 }
 
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -222,7 +222,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         // recreates the centre-emphasised fade of the brand mark.
         .icon(build_tray_template_icon())
         .icon_as_template(true)
-        .tooltip("Noctis Whisper")
+        .tooltip("Whisper")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the Noctis Whisper desktop app under a named profile.
+# Launch the Whisper desktop app under a named profile.
 #
 # Usage:
 #   scripts/run-profile.sh alice

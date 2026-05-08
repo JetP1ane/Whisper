@@ -107,7 +107,7 @@ copy_dylibs "$BUNDLE_DIR/i2pd" "$(dirname "$SRC_BIN")"
 # --- Rewrite load commands. Each dylib reference inside i2pd and inside
 #     each copied dylib gets rewritten to @executable_path-relative
 #     paths. The .app layout once Tauri places the bundle:
-#         Noctis Whisper.app/
+#         Whisper.app/
 #           Contents/
 #             MacOS/noctis-whisper-desktop  (main binary)
 #             Resources/

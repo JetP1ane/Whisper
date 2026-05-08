@@ -1,5 +1,5 @@
 /**
- * Noctis Whisper icon — centered amber bar flanked by mirrored fading
+ * Whisper icon — centered amber bar flanked by mirrored fading
  * gray waveform bars. The black rounded-rect background is rendered
  * unconditionally but hidden in light mode via a CSS rule keyed on
  * `:root.light` (see globals.css). Using CSS instead of a React state
@@ -20,7 +20,7 @@ export function NoctisOwl({
       height={size}
       viewBox="0 0 1024 1024"
       className={className}
-      aria-label="Noctis Whisper"
+      aria-label="Whisper"
       role="img"
     >
       {/* Black rounded-rect background — hidden in light mode by CSS. */}

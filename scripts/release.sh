@@ -108,15 +108,15 @@ esac
 rm -f "$CASK.bak"
 
 # --- 8. Stage the dmg under a canonical, brew-friendly filename ---
-# Tauri sometimes emits filenames with spaces ("Noctis Whisper_..."),
-# which gets percent-encoded in URLs and is awkward in scripts. Rename
-# to underscores so the cask's URL pattern matches deterministically.
+# Tauri emits "<productName>_<version>_<arch>.dmg". Stage under a
+# brand-stable canonical filename so the cask URL pattern matches
+# deterministically across product-name changes.
 case "$ARCH" in
   arm)   ARCH_TAG="aarch64" ;;
   intel) ARCH_TAG="x64" ;;
   *)     ARCH_TAG="unknown" ;;
 esac
-CANONICAL_NAME="Noctis_Whisper_${VERSION}_${ARCH_TAG}.dmg"
+CANONICAL_NAME="Whisper_${VERSION}_${ARCH_TAG}.dmg"
 cp "$DMG" "$DIST/$CANONICAL_NAME"
 echo "==> Staged: dist/$CANONICAL_NAME"
 

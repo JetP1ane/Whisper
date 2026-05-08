@@ -1,4 +1,4 @@
-# Distributing Noctis Whisper via Homebrew Cask
+# Distributing Whisper via Homebrew Cask
 
 This is the install path for users who don't want to manually download
 DMGs. From v0.1.3 onward the app is signed with an Apple Developer ID

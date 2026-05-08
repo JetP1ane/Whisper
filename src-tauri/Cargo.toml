@@ -1,7 +1,7 @@
 [package]
 name = "noctis-whisper-desktop"
 version = "0.1.0-alpha"
-description = "Noctis Whisper — private, post-quantum desktop messenger"
+description = "Whisper by Noctis Privacy — private, post-quantum desktop messenger"
 authors = ["Noctis Privacy"]
 edition = "2021"
 rust-version = "1.77"
