@@ -4,10 +4,14 @@
   <img src="public/readmeimage01.png" alt="Whisper by Noctis Privacy" width="720" />
 </p>
 
-A private, post-quantum, peer-to-peer messenger for macOS.
+A private, post-quantum, **decentralized** peer-to-peer messenger for macOS.
 
-No central server, no operator-run relay. The transport is I2P, so peers
-connect directly to each other through anonymous garlic-routed tunnels.
+No central server, no operator-run relay, no directory authority anyone
+can subpoena. The transport is **I2P** — a fully decentralized, garlic-
+routed overlay network whose router directory (NetDB) is itself a
+peer-to-peer DHT, so there is no global registry of users to enumerate.
+Peers connect directly to each other through anonymous tunnels built
+across that mesh.
 Cryptography is hybrid post-quantum and every session is protected by both
 classical X25519 and ML-KEM-1024, so an attacker has to break both legs
 to recover a key. Local storage is SQLCipher anchored to a hardware-bound

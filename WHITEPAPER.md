@@ -1,12 +1,12 @@
 # Whisper by Noctis Privacy
 
-A private, post-quantum, peer-to-peer messenger.
+A private, post-quantum, **decentralized** peer-to-peer messenger.
 
 ---
 
 ## What it is
 
-Whisper is a desktop messenger with no central server, hybrid post-quantum end-to-end encryption, and on-device hardware-anchored key storage. It runs on the I2P overlay network: messages traverse a chain of intermediate routers between the two endpoints, so passive network observers see neither message contents nor - under typical conditions - the social graph that most messengers leak.
+Whisper is a desktop messenger with no central server, no directory authority, hybrid post-quantum end-to-end encryption, and on-device hardware-anchored key storage. It runs on the **fully decentralized I2P overlay network**: messages traverse a chain of intermediate routers between the two endpoints, so passive network observers see neither message contents nor - under typical conditions - the social graph that most messengers leak. There is no operator infrastructure to subpoena, compromise, or unplug; the routing fabric is contributed by the I2P mesh itself, with each running router participating as a peer.
 
 This document is a description of the architecture, not a security proof. We separate cryptographic guarantees (provable from primitive assumptions and a correct implementation) from architectural properties (true by design, observable in code) from best-effort behaviors (depend on network conditions and resist most but not all adversaries). The boundaries are stated explicitly throughout.
 
@@ -16,8 +16,8 @@ This document is a description of the architecture, not a security proof. We sep
 
 Three architectural choices, taken together, distinguish Whisper from most "private" messengers:
 
-1. **No relay, no directory, no operator infrastructure.** The app does not connect to a server we run. There is no place to subpoena, compromise, or unplug.
-2. **The transport layer hides metadata that other E2E messengers leak.** End-to-end encryption protects message contents; the I2P overlay also obscures *who is talking to whom* from passive observers and from any single point of network observation. (This is a meaningful protection, not a perfect one - see *Threat model and limitations*.)
+1. **Fully decentralized — no relay, no directory, no operator infrastructure.** The app does not connect to a server we run, and Whisper has no centralized directory of users. The I2P NetDB that resolves destinations is a gossip-based DHT distributed across every running router, so there is no global registry to subpoena, compromise, or unplug.
+2. **The transport layer hides metadata that other E2E messengers leak.** End-to-end encryption protects message contents; the decentralized I2P overlay also obscures *who is talking to whom* from passive observers and from any single point of network observation. (This is a meaningful protection, not a perfect one - see *Threat model and limitations*.)
 3. **The crypto is hybrid post-quantum.** Today's ciphertexts are protected against an adversary that records traffic now and decrypts decades later when a sufficiently large quantum computer exists.
 
 ---

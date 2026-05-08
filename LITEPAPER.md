@@ -1,13 +1,13 @@
 # Whisper by Noctis Privacy — Lite Paper
 
-A private, post-quantum, peer-to-peer messenger.
+A private, post-quantum, **decentralized** peer-to-peer messenger.
 *One-pass overview. The full architecture lives in [WHITEPAPER.md](WHITEPAPER.md).*
 
 ---
 
 ## In one paragraph
 
-Whisper is a desktop messenger with three properties most messengers do not combine: there is no server we operate, the network transport obscures who is talking to whom - not just what they are saying - and the cryptography is hybrid post-quantum, protecting today's traffic against future quantum-capable adversaries. Message contents leave the device only after end-to-end encryption, and the local vault is protected by SQLCipher with key material bound to your Mac's Secure-Enclave-backed Keychain. The transport runs over I2P, chosen because its bidirectional hidden-destination model and garlic routing fit peer-to-peer chat better than traditional client/server anonymity networks.
+Whisper is a desktop messenger with three properties most messengers do not combine: it runs over a fully decentralized peer-to-peer transport with no server we operate (or any operator could operate), the network layer obscures who is talking to whom - not just what they are saying - and the cryptography is hybrid post-quantum, protecting today's traffic against future quantum-capable adversaries. Message contents leave the device only after end-to-end encryption, and the local vault is protected by SQLCipher with key material bound to your Mac's Secure-Enclave-backed Keychain. The transport runs over I2P, chosen because its bidirectional hidden-destination model and garlic routing fit peer-to-peer chat better than traditional client/server anonymity networks.
 
 ---
 
