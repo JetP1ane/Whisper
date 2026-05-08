@@ -40,7 +40,7 @@ homebrew/homebrew-cask clears review.)
 
 ## Status
 
-**v0.1.3** — beta-ready via Homebrew Cask.
+**v1.0.0** — first stable release, available via Homebrew Cask.
 
 Whisper has been through multiple rounds of independent security
 review covering the cryptographic protocol, the local SQLCipher vault,
