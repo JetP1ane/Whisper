@@ -15,13 +15,23 @@ export async function vaultSetup(passphrase: string): Promise<VaultSetupResult> 
   return invoke<VaultSetupResult>("vault_setup", { passphrase });
 }
 
+/**
+ * Restore a vault from a BIP39 recovery phrase.
+ *
+ * M-14: when an existing vault is on disk this is a destructive wipe.
+ * The backend now requires `confirmDestructiveWipe: true` so a stray
+ * (or attacker-injected) call without the flag fails before any state
+ * changes. Pass `true` only after a real user confirmation step.
+ */
 export async function vaultRecoverFromSeed(
   passphrase: string,
   recoveryPhrase: string,
+  confirmDestructiveWipe: boolean,
 ): Promise<VaultSetupResult> {
   return invoke<VaultSetupResult>("vault_recover_from_seed", {
     passphrase,
     recoveryPhrase,
+    confirmDestructiveWipe,
   });
 }
 

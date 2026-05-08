@@ -132,7 +132,7 @@ export function ConversationSettings({ conversation, onClose }: Props) {
                 <input
                   value={nickname}
                   onChange={(e) => setNickname(e.target.value)}
-                  placeholder="Mark"
+                  placeholder="John Doe"
                   className="input flex-1"
                 />
                 <button

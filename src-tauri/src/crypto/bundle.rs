@@ -17,6 +17,7 @@
 //! writeField(bundle_signature)         // 64 bytes — Ed25519 over the entire payload
 //! writeString(alias)                   // length-prefixed UTF-8, len = -1 for null
 //! writeString(display_name)
+//! writeField(i2p_destination)          // base64 I2P destination, may be empty
 //! ```
 //!
 //! `writeField(b)`  = `[4B BE len][bytes]`
@@ -28,13 +29,10 @@ use ed25519_dalek::{
     Signature, Signer, SigningKey as EdSigningKey, Verifier, VerifyingKey as EdVerifyingKey,
 };
 
-/// Bundle version 2 added `relay_url` for cross-relay messaging.
-/// Bundle version 3 adds `i2p_destination` so peers can reach this owner
-/// over I2P directly without ever touching a relay. v3 keeps `relay_url`
-/// in the layout so older v2 readers (and the relay-fallback path)
-/// continue to deserialize. New installs leave `relay_url` empty when
-/// I2P is the only transport.
-pub const BUNDLE_VERSION: i32 = 3;
+/// Bundle version 4: relay_url removed (was v2's transport hint), only
+/// I2P destinations are carried. v1/v2/v3 bundles can no longer be
+/// parsed by this client.
+pub const BUNDLE_VERSION: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicKeyBundle {
@@ -47,12 +45,8 @@ pub struct PublicKeyBundle {
     pub bundle_signature: [u8; 64], // Ed25519 over the unsigned payload
     pub alias: String,
     pub display_name: Option<String>,
-    /// Owner's home relay URL (legacy v2 transport path). Empty for new
-    /// I2P-only installs.
-    pub relay_url: String,
-    /// Owner's I2P destination (base64). Empty for legacy v1/v2 bundles
-    /// that predate the I2P transport. When non-empty, recipients
-    /// deliver via I2P directly through this destination.
+    /// Owner's I2P destination (base64). The only transport-layer
+    /// identifier in the bundle; recipients dial this directly.
     pub i2p_destination: String,
 }
 
@@ -104,7 +98,6 @@ pub fn serialize(b: &PublicKeyBundle) -> Vec<u8> {
         + 4 + b.bundle_signature.len()
         + 4 + b.alias.len()
         + 4 + b.display_name.as_ref().map(|s| s.len()).unwrap_or(0)
-        + 4 + b.relay_url.len()
         + 4 + b.i2p_destination.len();
     let mut out = Vec::with_capacity(cap);
     write_i32(&mut out, b.version);
@@ -121,8 +114,7 @@ pub fn serialize(b: &PublicKeyBundle) -> Vec<u8> {
     write_field(&mut out, &b.bundle_signature);
     write_string(&mut out, Some(&b.alias));
     write_string(&mut out, b.display_name.as_deref());
-    write_field(&mut out, b.relay_url.as_bytes()); // v2 trailing field
-    write_field(&mut out, b.i2p_destination.as_bytes()); // v3 trailing field
+    write_field(&mut out, b.i2p_destination.as_bytes());
     out
 }
 
@@ -142,8 +134,13 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_field(&mut self) -> CryptoResult<&'a [u8]> {
-        let len = self.read_i32()? as usize;
-        if self.off + len > self.data.len() {
+        let raw = self.read_i32()?;
+        if raw < 0 {
+            return Err(CryptoError::Decode("bundle field has negative length"));
+        }
+        let len = raw as usize;
+        // saturating_sub avoids the off + len wraparound on huge len values.
+        if len > self.data.len().saturating_sub(self.off) {
             return Err(CryptoError::Decode("bundle truncated (field)"));
         }
         let slice = &self.data[self.off..self.off + len];
@@ -153,11 +150,14 @@ impl<'a> Cursor<'a> {
 
     fn read_string(&mut self) -> CryptoResult<Option<String>> {
         let len = self.read_i32()?;
-        if len < 0 {
+        if len == -1 {
             return Ok(None);
         }
+        if len < 0 {
+            return Err(CryptoError::Decode("bundle string has negative length"));
+        }
         let len = len as usize;
-        if self.off + len > self.data.len() {
+        if len > self.data.len().saturating_sub(self.off) {
             return Err(CryptoError::Decode("bundle truncated (string)"));
         }
         let s = std::str::from_utf8(&self.data[self.off..self.off + len])
@@ -204,22 +204,9 @@ pub fn deserialize(bytes: &[u8]) -> CryptoResult<PublicKeyBundle> {
         .read_string()?
         .ok_or(CryptoError::Decode("bundle alias is null"))?;
     let display_name = c.read_string()?;
-    // v2: relay_url. v1 bundles don't have it; tolerate by reading empty.
-    let relay_url = if c.off < c.data.len() {
-        std::str::from_utf8(c.read_field()?)
-            .map_err(|_| CryptoError::Decode("bundle relay_url not UTF-8"))?
-            .to_string()
-    } else {
-        String::new()
-    };
-    // v3: i2p_destination. v1/v2 bundles don't have it; tolerate by reading empty.
-    let i2p_destination = if c.off < c.data.len() {
-        std::str::from_utf8(c.read_field()?)
-            .map_err(|_| CryptoError::Decode("bundle i2p_destination not UTF-8"))?
-            .to_string()
-    } else {
-        String::new()
-    };
+    let i2p_destination = std::str::from_utf8(c.read_field()?)
+        .map_err(|_| CryptoError::Decode("bundle i2p_destination not UTF-8"))?
+        .to_string();
 
     Ok(PublicKeyBundle {
         version,
@@ -240,7 +227,6 @@ pub fn deserialize(bytes: &[u8]) -> CryptoResult<PublicKeyBundle> {
         bundle_signature: bundle_sig,
         alias,
         display_name,
-        relay_url,
         i2p_destination,
     })
 }
@@ -259,7 +245,7 @@ pub fn build_signed_bundle(
     otpk: OneTimePrekeyPublic,
     alias: String,
     display_name: Option<String>,
-    relay_url: String,
+    _legacy_relay_url: String,
     i2p_destination: String,
 ) -> PublicKeyBundle {
     let mut placeholder = PublicKeyBundle {
@@ -272,7 +258,6 @@ pub fn build_signed_bundle(
         bundle_signature: [0u8; 64],
         alias,
         display_name,
-        relay_url,
         i2p_destination,
     };
     let payload = serialize(&placeholder);
@@ -302,15 +287,13 @@ pub fn verify_bundle(b: &PublicKeyBundle) -> CryptoResult<()> {
         .map_err(|_| CryptoError::Decode("spk signature failed to verify"))?;
 
     // 3. **Alias / identity-key binding.** The alias is a deterministic
-    //    function of the identity key (`BIP39(SHA-256(identity_key)[:33b])`),
-    //    so `bundle.alias` must equal that derivation. This closes the
-    //    relay-MITM-by-bundle-substitution gap: a malicious relay cannot
-    //    serve Eve's bundle as the answer to "give me Bob's alias" because
-    //    Eve's identity key produces a different alias.
+    //    function of the identity key, so `bundle.alias` must match the
+    //    derivation. Closes a substitution gap where someone could try
+    //    to serve a different bundle under another user's alias.
     let derived = crate::crypto::keys::derive_alias(&b.identity_key);
     if derived != b.alias {
         return Err(CryptoError::Decode(
-            "bundle alias does not match identity key (possible relay substitution)",
+            "bundle alias does not match identity key",
         ));
     }
 
@@ -380,88 +363,25 @@ pub fn base58_decode(input: &str) -> CryptoResult<Vec<u8>> {
     Ok(result)
 }
 
-/// Build a sharable invite link.
-///
-/// `whisper://c/<base58>` — the bundle itself includes `relay_url`, so the
-/// recipient picks it up from the parsed payload. The optional `?relay=...`
-/// query parameter is included as a hint for human readers and is verified
-/// against the bundle's own `relay_url` on parse (mismatch ⇒ rejected).
+/// Build a sharable invite link: `whisper://c/<base58>`.
 pub fn build_whisper_link(b: &PublicKeyBundle) -> String {
     let body = base58_encode(&serialize(b));
-    if b.relay_url.is_empty() {
-        format!("whisper://c/{}", body)
-    } else {
-        format!(
-            "whisper://c/{}?relay={}",
-            body,
-            url_encode(&b.relay_url)
-        )
-    }
+    format!("whisper://c/{}", body)
 }
 
 pub fn parse_whisper_link(input: &str) -> CryptoResult<PublicKeyBundle> {
     let prefix = "whisper://c/";
     let trimmed = input.trim();
     let body = trimmed.strip_prefix(prefix).unwrap_or(trimmed);
-    // Split off query string if present.
-    let (b58, query) = match body.find('?') {
-        Some(i) => (&body[..i], Some(&body[i + 1..])),
-        None => (body, None),
+    // Older links may carry a `?relay=` query string — strip it and ignore.
+    let b58 = match body.find('?') {
+        Some(i) => &body[..i],
+        None => body,
     };
     let bytes = base58_decode(b58)?;
     let bundle = deserialize(&bytes)?;
     verify_bundle(&bundle)?;
-
-    // If a `relay=` hint was provided, sanity-check against the bundle's
-    // signed `relay_url`. The signed value is authoritative.
-    if let Some(q) = query {
-        for kv in q.split('&') {
-            if let Some(rest) = kv.strip_prefix("relay=") {
-                let hinted = url_decode(rest);
-                if !bundle.relay_url.is_empty() && hinted != bundle.relay_url {
-                    return Err(CryptoError::Decode(
-                        "whisper link `relay=` hint disagrees with signed bundle relay_url",
-                    ));
-                }
-            }
-        }
-    }
     Ok(bundle)
-}
-
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                .map(|s| u8::from_str_radix(s, 16))
-            {
-                if let Ok(byte) = hex {
-                    out.push(byte);
-                    i += 3;
-                    continue;
-                }
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -483,7 +403,6 @@ mod tests {
             x25519_pub: [22u8; 32],
             kyber_pub: kyber.clone(),
         };
-        // Alias must derive from the identity key — verify_bundle now enforces this.
         let id_key = signing.verifying_key().to_bytes();
         let alias = crate::crypto::keys::derive_alias(&id_key);
         build_signed_bundle(
@@ -495,7 +414,7 @@ mod tests {
             otpk,
             alias,
             Some("test".into()),
-            "wss://test.example.com/ws".into(),
+            String::new(),
             "I2P_DEST_TEST_PLACEHOLDER".into(),
         )
     }
@@ -517,18 +436,12 @@ mod tests {
     #[test]
     fn tampered_bundle_fails_verification() {
         let mut b = dummy_bundle();
-        // Picking another valid alias triggers BOTH the alias-binding
-        // check (different SHA-256) and the signature check (signed payload
-        // changes); either failure is expected.
         b.alias = "abandon-abandon-abandon".into();
         assert!(verify_bundle(&b).is_err());
     }
 
     #[test]
     fn alias_substitution_fails_verification() {
-        // A relay swapping bundles cannot keep the original alias because
-        // the alias is bound to the identity key. Even with a valid
-        // signature on the substitute, the alias check fires.
         let bob_signing = SigningKey::from_bytes(&[7u8; 32]);
         let bob_alias = crate::crypto::keys::derive_alias(&bob_signing.verifying_key().to_bytes());
 
@@ -547,8 +460,7 @@ mod tests {
             x25519_pub: [22u8; 32],
             kyber_pub: kyber.clone(),
         };
-        // Eve signs a bundle that claims Bob's alias.
-        let mut substituted = build_signed_bundle(
+        let substituted = build_signed_bundle(
             &eve_signing,
             eve_signing.verifying_key().to_bytes(),
             [33u8; 32],
@@ -557,20 +469,14 @@ mod tests {
             otpk,
             bob_alias.clone(),
             None,
-            "wss://eve.example.com/ws".into(),
+            String::new(),
             "I2P_DEST_EVE".into(),
         );
-        // Eve's signature on the bundle is valid (she signed it), but the
-        // alias-vs-identity-key check rejects the substitution.
         assert_ne!(
             substituted.alias,
             crate::crypto::keys::derive_alias(&substituted.identity_key)
         );
         assert!(verify_bundle(&substituted).is_err());
-        // Sanity: with Eve's *own* alias the bundle verifies.
-        substituted.alias =
-            crate::crypto::keys::derive_alias(&substituted.identity_key);
-        let _ = substituted; // We rely on the test path above.
     }
 
     #[test]
@@ -585,6 +491,35 @@ mod tests {
             let back = base58_decode(&s).unwrap();
             assert_eq!(back, input);
         }
+    }
+
+    #[test]
+    fn deserialize_rejects_negative_length_field() {
+        // CRIT-1 regression: a negative i32 length field used to cast to
+        // a near-usize::MAX size, wrap the bounds check, then panic on
+        // slice. Now it returns Err cleanly.
+        let bytes = [0xFFu8, 0xFF, 0xFF, 0xFF];
+        let r = deserialize(&bytes);
+        assert!(matches!(r, Err(CryptoError::Decode(_))));
+    }
+
+    #[test]
+    fn deserialize_rejects_oversize_length_field() {
+        // version=4, then a field claiming 0x7FFFFFFF bytes follows.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(&i32::MAX.to_be_bytes());
+        let r = deserialize(&bytes);
+        assert!(matches!(r, Err(CryptoError::Decode(_))));
+    }
+
+    #[test]
+    fn parse_whisper_link_rejects_corrupt_payload() {
+        // Random base58 garbage decodes to a payload whose first field
+        // length is negative; parse_whisper_link must error, not panic.
+        let link = "whisper://c/zzzzzzzzzzzzzzzzzzzz";
+        let r = parse_whisper_link(link);
+        assert!(r.is_err());
     }
 
     #[test]

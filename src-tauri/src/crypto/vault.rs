@@ -43,14 +43,17 @@ pub fn derive_vault_key(passphrase: &[u8], salt: &[u8]) -> CryptoResult<Zeroizin
 /// Generate a fresh random 32-byte salt.
 pub fn generate_salt() -> [u8; VAULT_SALT_LEN] {
     let mut salt = [0u8; VAULT_SALT_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
+    // M-1: vault salt + DEK come from OsRng (getrandom syscall), not
+    // thread_rng — these are master-key-tier secrets and the small
+    // syscall cost is justified.
+    rand::rngs::OsRng.fill_bytes(&mut salt);
     salt
 }
 
 /// Generate a fresh random 32-byte DEK.
 pub fn generate_dek() -> Zeroizing<[u8; DEK_LEN]> {
     let mut dek = Zeroizing::new([0u8; DEK_LEN]);
-    rand::thread_rng().fill_bytes(&mut *dek);
+    rand::rngs::OsRng.fill_bytes(&mut *dek);
     dek
 }
 

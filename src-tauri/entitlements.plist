@@ -8,35 +8,55 @@
     <key>com.apple.security.app-sandbox</key>
     <true/>
 
-    <!-- Hardened Runtime: only what we need -->
+    <!-- Outbound network egress: SAM TCP to the loopback i2pd, plus the
+         I2P subprocess's NTCP2/SSU2 traffic to other routers. -->
     <key>com.apple.security.network.client</key>
     <true/>
 
-    <!-- Allow inbound TCP listeners — we run the SAM bridge on a
-         randomized loopback port and i2pd itself binds for transit
-         routing (when opted in). -->
+    <!-- Inbound: i2pd's NTCP2/SSU2 listeners need this to receive
+         replies on the randomized net_port. We do NOT bind any other
+         server socket from the parent process. -->
     <key>com.apple.security.network.server</key>
     <true/>
-
-    <!--
-        Keychain access. Under ad-hoc signing there is no team-ID prefix, so
-        we omit `keychain-access-groups` and let macOS use the default group
-        equal to the bundle identifier. For Mac App Store / Developer ID
-        builds, add:
-            <key>keychain-access-groups</key>
-            <array><string>$(AppIdentifierPrefix)com.noctisprivacy.whisper</string></array>
-    -->
 
     <!-- Allow user-selected files for attachment picking -->
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
 
-    <!-- Hardened runtime guards -->
+    <!--
+        ===== Hardened Runtime =====
+        All flags default to "deny" via Hardened Runtime; we only set
+        them explicitly to false to make intent visible in audits. The
+        absence of an `allow-*` entitlement is what actually denies the
+        capability — Apple treats the entitlement as "request to allow."
+    -->
+
+    <!-- Deny JIT pages (no code generation in this app). -->
     <key>com.apple.security.cs.allow-jit</key>
     <false/>
+
+    <!-- Deny RWX / unsigned executable memory mappings. -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <false/>
+
+    <!-- Library validation: only Apple-signed dylibs or dylibs signed
+         with the same Team ID as the main binary may be loaded. Stops
+         DYLD_INSERT_LIBRARIES-style injection cold. The bundled i2pd
+         dylibs under Contents/Resources/i2pd-bundle/lib/ are signed
+         alongside the main binary, so they pass validation. -->
     <key>com.apple.security.cs.disable-library-validation</key>
+    <false/>
+
+    <!-- Deny DYLD_* environment variables (the classic injection vector). -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <false/>
+
+    <!-- Deny task_for_pid / debugger attach. -->
+    <key>com.apple.security.cs.debugger</key>
+    <false/>
+
+    <!-- Deny W^X bypass on executable pages. -->
+    <key>com.apple.security.cs.disable-executable-page-protection</key>
     <false/>
 </dict>
 </plist>

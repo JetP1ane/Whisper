@@ -79,7 +79,9 @@ pub fn handle_blob(
         DecodedEnvelope::DeliveryReceipt { .. }
         | DecodedEnvelope::RelayUpdate { .. }
         | DecodedEnvelope::RoomInvite { .. }
-        | DecodedEnvelope::RoomSenderKey { .. } => {
+        | DecodedEnvelope::RoomSenderKey { .. }
+        | DecodedEnvelope::RoomSenderKeyAck { .. }
+        | DecodedEnvelope::MessageReaction { .. } => {
             // Legacy single-shot receiver path doesn't handle inner control
             // envelopes; the pump-driven `inbound` module is the live one.
             return Err(anyhow!(
@@ -235,8 +237,12 @@ impl<'a> SessionInitCursor<'a> {
         Ok(v)
     }
     fn read_field(&mut self) -> Result<&'a [u8]> {
-        let len = self.read_i32()? as usize;
-        if self.off + len > self.data.len() {
+        let raw = self.read_i32()?;
+        if raw < 0 {
+            return Err(anyhow!("session-init field has negative length"));
+        }
+        let len = raw as usize;
+        if len > self.data.len().saturating_sub(self.off) {
             return Err(anyhow!("session-init truncated (field)"));
         }
         let s = &self.data[self.off..self.off + len];

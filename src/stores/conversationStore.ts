@@ -44,7 +44,21 @@ export interface DisplayMessage {
    *  `"relay"`. `null` for inbound rows or pre-Phase-6 sends. The
    *  bubble renders a small icon distinguishing them. */
   delivery_transport: string | null;
+  /** Number of times the I2P send-queue worker has retried delivery.
+   *  Non-null only for outbound queued rows currently in the queue. */
+  attempt_count: number | null;
+  /** Unix-ms of the last delivery attempt, or null if never attempted. */
+  last_attempt_at: number | null;
+  /** Emoji reactions on this message, grouped per emoji. */
+  reactions: ReactionGroup[];
   created_at: number;
+}
+
+export interface ReactionGroup {
+  emoji: string;
+  count: number;
+  /** True iff *this* device contributed at least one of the count. */
+  mine: boolean;
 }
 
 interface State {
@@ -76,8 +90,22 @@ export const useConversationStore = create<State>((set, get) => ({
     }
   },
   selectConversation: (id) => {
-    set({ selectedId: id, messages: [] });
-    if (id) get().loadMessages(id);
+    if (id) {
+      // Optimistic clear so the green badge disappears instantly on
+      // click instead of waiting for the backend roundtrip + the
+      // `conversations:changed` event. The backend mark_read still
+      // runs for durability — if it fails the worst that happens is
+      // the badge re-appears on the next loadConversations.
+      const prev = get().conversations;
+      const cleared = prev.map((c) =>
+        c.id === id && c.unread_count > 0 ? { ...c, unread_count: 0 } : c,
+      );
+      set({ selectedId: id, messages: [], conversations: cleared });
+      get().loadMessages(id);
+      invoke("conversation_mark_read", { conversationId: id }).catch(() => {});
+    } else {
+      set({ selectedId: id, messages: [] });
+    }
   },
   loadMessages: async (conversationId) => {
     try {

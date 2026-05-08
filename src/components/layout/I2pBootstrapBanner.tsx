@@ -8,28 +8,31 @@ interface I2pStatus {
   sam_addr: string;
   log_path: string;
   cached_outbound_streams: number;
+  bootstrap_attempt: number;
+  bootstrap_last_error: string | null;
+  bootstrap_in_flight: boolean;
 }
 
 /**
- * Top-of-window banner that surfaces I2P bootstrap progress prominently.
+ * Top-of-window banner that surfaces I2P bootstrap progress.
  *
- * I2P's first-launch bootstrap (reseed → tunnels → encrypted leaseset
- * publish → master STREAM session) takes 30-90 seconds end-to-end. Until
- * this completes, the user can't send or receive anything peer-to-peer.
- * Without a visible signal, the app feels broken.
- *
- * The banner:
- *  - Polls `i2p_status` every 1 second
- *  - Tracks elapsed time since first observed not-ready
- *  - Shows progressive phase labels matching the actual i2pd boot stages
- *  - Auto-dismisses (slide-up animation) the moment `ready` flips true
- *  - Shows an explicit error state if bootstrap exceeds 2 minutes
+ * Three principles:
+ *  1. The Rust side retries forever — port collisions, "SAM bridge not
+ *     ready yet", transient tunnel failures all clear in seconds. We
+ *     surface a single "starting up" state across all of them; never
+ *     "error" / "failed" wording in the user-visible banner.
+ *  2. Elapsed time is monotonic (since the first attempt), not
+ *     per-attempt — fewer surprising counter resets while waiting.
+ *  3. The full backend error string is still attached as a tooltip
+ *     on the message text, for dev / power-user inspection.
  */
 export function I2pBootstrapBanner() {
   const [status, setStatus] = useState<I2pStatus | null>(null);
   const [elapsedSecs, setElapsedSecs] = useState(0);
   const [hidden, setHidden] = useState(false);
-  const startedAt = useRef<number | null>(null);
+  // We track total elapsed since the *first* bootstrap attempt, not
+  // per-attempt — a monotonic counter. Resets when SAM goes ready.
+  const bootstrapStartedAt = useRef<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -38,23 +41,22 @@ export function I2pBootstrapBanner() {
         const s = await invoke<I2pStatus>("i2p_status");
         if (cancelled) return;
         setStatus(s);
-        if (!s.ready) {
-          if (startedAt.current === null) {
-            startedAt.current = Date.now();
-          }
-          setElapsedSecs(Math.floor((Date.now() - startedAt.current) / 1000));
-        } else {
-          // Reset for any future not-ready window (e.g. after i2pd restart).
-          startedAt.current = null;
+        if (s.ready) {
+          bootstrapStartedAt.current = null;
           setElapsedSecs(0);
-          // Brief delay before hiding so the user sees the green "Connected"
-          // state, then the banner slides away.
           setTimeout(() => {
             if (!cancelled) setHidden(true);
           }, 1500);
+          return;
         }
+        if (bootstrapStartedAt.current === null) {
+          bootstrapStartedAt.current = Date.now();
+        }
+        setElapsedSecs(
+          Math.floor((Date.now() - bootstrapStartedAt.current) / 1000),
+        );
       } catch {
-        /* ignore — vault may be locking, we'll retry */
+        /* vault locking — try again next tick */
       }
     };
     tick();
@@ -65,11 +67,9 @@ export function I2pBootstrapBanner() {
     };
   }, []);
 
-  // Hidden once ready+1.5s elapsed, OR before any status loaded.
   if (hidden) return null;
   if (status === null) return null;
 
-  // Connected — render briefly with the success state, then unmount.
   if (status.ready) {
     return (
       <div className="px-4 py-2 bg-status-ok/10 border-b border-status-ok/30 flex items-center gap-3 animate-fade-in">
@@ -84,56 +84,44 @@ export function I2pBootstrapBanner() {
     );
   }
 
-  // Bootstrapping — staged messages by elapsed time.
+  const lastErr = status.bootstrap_last_error;
   const phase = phaseLabel(elapsedSecs);
-  const isError = elapsedSecs >= 120;
+  // The Rust side retries forever (port races, transient tunnel failures,
+  // and "i2pd booted but SAM not ready yet" all clear within seconds).
+  // We deliberately don't expose those transient errors to the user —
+  // every bootstrap state below ready is a normal "starting up" state
+  // and renders the same warm progress banner. The full error string
+  // is still available on hover for power users / dev diagnostics.
   return (
     <div
-      className={
-        "px-4 py-2 border-b flex items-center gap-3 " +
-        (isError
-          ? "bg-status-err/10 border-status-err/30"
-          : "bg-status-warn/10 border-status-warn/30")
-      }
+      className="px-4 py-2 border-b flex items-center gap-3 bg-status-warn/10 border-status-warn/30"
     >
-      {isError ? (
-        <span className="w-2 h-2 rounded-full bg-status-err shrink-0" />
-      ) : (
-        <span className="w-2 h-2 rounded-full bg-status-warn shrink-0 animate-pulse" />
-      )}
-      <span className="text-xs text-text-primary flex-1">{phase}</span>
+      <span className="w-2 h-2 rounded-full shrink-0 bg-status-warn animate-pulse" />
+      <span
+        className="text-xs text-text-primary flex-1 truncate"
+        title={lastErr ?? undefined}
+      >
+        {phase}
+      </span>
       <span className="text-[10px] font-mono text-text-tertiary tabular-nums">
         {elapsedSecs}s
       </span>
-      {isError && (
-        <a
-          href="#"
-          onClick={(e) => {
-            e.preventDefault();
-            // Surface the i2pd log path so the user can debug.
-            // (Settings → Security shows the same path.)
-          }}
-          className="text-[10px] font-mono text-status-err hover:underline"
-        >
-          troubleshoot
-        </a>
-      )}
     </div>
   );
 }
 
 function phaseLabel(elapsedSecs: number): string {
   if (elapsedSecs >= 120) {
-    return "I2P network is taking longer than expected. Check Settings → Security for diagnostics.";
+    return "Still connecting to the private network…";
   }
   if (elapsedSecs >= 60) {
-    return "Bootstrapping into the I2P network… first launch can take up to 2 minutes";
+    return "Building anonymous tunnels — first launch can take a minute…";
   }
   if (elapsedSecs >= 30) {
     return "Building anonymous tunnels…";
   }
   if (elapsedSecs >= 10) {
-    return "Connecting to I2P peers…";
+    return "Connecting to peers…";
   }
   return "Starting private network…";
 }

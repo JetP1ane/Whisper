@@ -207,44 +207,58 @@ pub fn decrypt_message(
     ciphertext: &[u8],
     aad_builder: impl Fn(&[u8; 32], u32, u32) -> [u8; 40],
 ) -> CryptoResult<Vec<u8>> {
-    // 1) try cached skipped key
-    let key = SkipKey {
+    // CRIT-2 invariant: do NOT mutate `state` until aead_open has succeeded.
+    // A forged/corrupt ciphertext that survived the framing layer must not
+    // be able to roll the DH ratchet, drop a skipped-key, or advance the
+    // recv chain — otherwise the next legitimate message becomes
+    // un-decryptable. We compute everything against a scratch clone (or
+    // peek without remove for the cached path), then commit on success.
+    let aad = aad_builder(sender_dh_pub, prev_chain_len, msg_num);
+
+    // 1) try cached skipped key — peek; only evict after AEAD passes.
+    let skip_key = SkipKey {
         dh_pub: *sender_dh_pub,
         msg_num,
     };
-    if let Some(mk) = state.skipped.remove(&key) {
-        return aead_open(&mk, nonce, ciphertext, &aad_builder(sender_dh_pub, prev_chain_len, msg_num));
+    if let Some(mk) = state.skipped.get(&skip_key).copied() {
+        let plaintext = aead_open(&mk, nonce, ciphertext, &aad)?;
+        if let Some(mut v) = state.skipped.remove(&skip_key) {
+            v.zeroize();
+        }
+        return Ok(plaintext);
     }
 
-    // 2) DH ratchet step if peer's pub changed
-    let needs_step = match state.dh_recv_public {
+    // 2) Derive on a clone so any failure leaves the live state intact.
+    let mut scratch = state.clone();
+    let needs_step = match scratch.dh_recv_public {
         Some(p) => p != *sender_dh_pub,
         None => true,
     };
     if needs_step {
-        // Cache any skipped keys from the *previous* recv chain up to prev_chain_len.
-        if let (Some(_), Some(prev_recv_chain)) = (state.dh_recv_public, state.recv_chain_key) {
-            cache_skipped_keys(state, &prev_recv_chain, state.recv_msg_num, prev_chain_len)?;
+        if let (Some(_), Some(prev_recv_chain)) =
+            (scratch.dh_recv_public, scratch.recv_chain_key)
+        {
+            let from = scratch.recv_msg_num;
+            cache_skipped_keys(&mut scratch, &prev_recv_chain, from, prev_chain_len)?;
         }
-        dh_ratchet_step(state, sender_dh_pub)?;
+        dh_ratchet_step(&mut scratch, sender_dh_pub)?;
     }
 
-    // 3) advance the recv chain to msg_num, caching message keys we skip
-    let recv_chain = state
+    let recv_chain = scratch
         .recv_chain_key
         .as_ref()
         .copied()
         .ok_or(CryptoError::RatchetState("recv chain not established"))?;
-    let (final_chain, msg_key) = advance_chain_to(state, recv_chain, msg_num, sender_dh_pub)?;
-    state.recv_chain_key = Some(final_chain);
-    state.recv_msg_num = msg_num + 1;
+    let (final_chain, msg_key) =
+        advance_chain_to(&mut scratch, recv_chain, msg_num, sender_dh_pub)?;
+    scratch.recv_chain_key = Some(final_chain);
+    scratch.recv_msg_num = msg_num + 1;
 
-    aead_open(
-        &msg_key,
-        nonce,
-        ciphertext,
-        &aad_builder(sender_dh_pub, prev_chain_len, msg_num),
-    )
+    let plaintext = aead_open(&msg_key, nonce, ciphertext, &aad)?;
+
+    // Commit. Drop on the old state zeroizes its key material.
+    *state = scratch;
+    Ok(plaintext)
 }
 
 fn dh_ratchet_step(state: &mut RatchetState, peer_dh_pub: &[u8; 32]) -> CryptoResult<()> {
@@ -361,6 +375,11 @@ fn aead_open(
 fn generate_nonce() -> [u8; 12] {
     use rand::RngCore;
     let mut n = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut n);
+    // M-1: pull AEAD nonces from OsRng (getrandom syscall) rather than
+    // thread_rng. The probability of a thread_rng collision after 2^48
+    // draws is around 2^-48; OsRng's reseed cadence makes that bound
+    // tighter for ratchet nonces, where a collision under the same
+    // message key is catastrophic.
+    rand::rngs::OsRng.fill_bytes(&mut n);
     n
 }

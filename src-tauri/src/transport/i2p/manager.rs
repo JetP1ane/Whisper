@@ -64,10 +64,29 @@ use tokio::process::{Child, Command};
 /// Dev: Homebrew at `/opt/homebrew/opt/i2pd/bin/i2pd`. Tests can set
 /// `WHISPER_I2PD_BINARY` to point at a custom build.
 fn locate_i2pd_binary() -> I2pResult<PathBuf> {
-    if let Ok(p) = std::env::var("WHISPER_I2PD_BINARY") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Ok(path);
+    // The env-override and brew fallbacks are dev affordances. In a
+    // release build they're a downgrade: an attacker who can plant
+    // `~/.zshrc` exports or a malicious /opt/homebrew binary controls
+    // our network stack. Restrict to debug builds.
+    if cfg!(debug_assertions) {
+        if let Ok(p) = std::env::var("WHISPER_I2PD_BINARY") {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+        // Project-local `i2pd-bundle/i2pd` next to Cargo.toml. This is
+        // the same tree `build.rs` walked to embed the per-file SHA-256
+        // manifest, so `verify_i2pd_pin` finds every dylib + cert in
+        // the layout it expects. Without this preference, dev runs
+        // would fall through to the homebrew binary below — which has
+        // no companion `lib/` or `certificates/` siblings, and the
+        // pin walk fails on the first dylib lookup.
+        let src_bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("i2pd-bundle")
+            .join("i2pd");
+        if src_bundle.is_file() {
+            return Ok(src_bundle);
         }
     }
     // Bundled inside the .app. Walk up from the current exe path:
@@ -86,16 +105,20 @@ fn locate_i2pd_binary() -> I2pResult<PathBuf> {
             }
         }
     }
-    let brew = PathBuf::from("/opt/homebrew/opt/i2pd/bin/i2pd");
-    if brew.is_file() {
-        return Ok(brew);
-    }
-    let brew_intel = PathBuf::from("/usr/local/opt/i2pd/bin/i2pd");
-    if brew_intel.is_file() {
-        return Ok(brew_intel);
+    if cfg!(debug_assertions) {
+        let brew = PathBuf::from("/opt/homebrew/opt/i2pd/bin/i2pd");
+        if brew.is_file() {
+            return Ok(brew);
+        }
+        let brew_intel = PathBuf::from("/usr/local/opt/i2pd/bin/i2pd");
+        if brew_intel.is_file() {
+            return Ok(brew_intel);
+        }
     }
     Err(I2pError::Subprocess(
-        "i2pd binary not found (set WHISPER_I2PD_BINARY, install via brew, or bundle in Resources/i2pd-bundle/)"
+        "i2pd binary not found (release builds require the bundled \
+         Resources/i2pd-bundle/i2pd; debug builds may set WHISPER_I2PD_BINARY \
+         or install via brew)"
             .into(),
     ))
 }
@@ -105,10 +128,12 @@ fn locate_i2pd_binary() -> I2pResult<PathBuf> {
 /// datadir. Homebrew installs them into the Cellar; the bundled .app
 /// keeps them next to the i2pd binary in `Resources/certificates/`.
 fn locate_i2pd_certificates() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("WHISPER_I2PD_CERTIFICATES") {
-        let path = PathBuf::from(p);
-        if path.is_dir() {
-            return Some(path);
+    if cfg!(debug_assertions) {
+        if let Ok(p) = std::env::var("WHISPER_I2PD_CERTIFICATES") {
+            let path = PathBuf::from(p);
+            if path.is_dir() {
+                return Some(path);
+            }
         }
     }
     // Production: Resources/i2pd-bundle/certificates/ alongside the binary.
@@ -125,15 +150,127 @@ fn locate_i2pd_certificates() -> Option<PathBuf> {
             }
         }
     }
-    let brew = PathBuf::from("/opt/homebrew/Cellar/i2pd/2.60.0/share/i2pd/certificates");
-    if brew.is_dir() {
-        return Some(brew);
-    }
-    let brew_intel = PathBuf::from("/usr/local/Cellar/i2pd/2.60.0/share/i2pd/certificates");
-    if brew_intel.is_dir() {
-        return Some(brew_intel);
+    if cfg!(debug_assertions) {
+        let brew = PathBuf::from("/opt/homebrew/Cellar/i2pd/2.60.0/share/i2pd/certificates");
+        if brew.is_dir() {
+            return Some(brew);
+        }
+        let brew_intel = PathBuf::from("/usr/local/Cellar/i2pd/2.60.0/share/i2pd/certificates");
+        if brew_intel.is_dir() {
+            return Some(brew_intel);
+        }
     }
     None
+}
+
+// Per-file SHA-256 manifest of `i2pd-bundle/`, generated at compile time
+// by `build.rs` and emitted to OUT_DIR. Empty when the bundle wasn't
+// present at build time (dev builds before `scripts/bundle-i2pd.sh`
+// runs). The manifest covers the i2pd binary AND every dylib and
+// certificate file under the bundle root.
+include!(concat!(env!("OUT_DIR"), "/i2pd_bundle_manifest.rs"));
+
+/// Verify every file under `i2pd-bundle/` matches the SHA-256 we
+/// computed at build time. Refuses to spawn on any mismatch.
+///
+/// Why every file (NEW-3): the previous version pinned only the i2pd
+/// executable, which left the dylibs and reseed certs unverified. The
+/// dynamic pentest pass demonstrated that an attacker who can replace
+/// `i2pd-bundle/lib/libcrypto.3.dylib` and ad-hoc re-sign it would be
+/// loaded by dyld at i2pd spawn (i2pd has no hardened-runtime flag,
+/// so library validation is not enforced for it). The manifest closes
+/// that gap — any byte-level change to anything in the bundle is now
+/// caught before we hand control to i2pd.
+///
+/// Skipped (with a warning) when the build-time manifest is empty.
+/// Always skipped when the operator has explicitly pointed at a
+/// custom binary via `WHISPER_I2PD_BINARY` — that's a development
+/// affordance where the user is providing their own integrity
+/// guarantee. The env override is gated on debug builds.
+fn verify_i2pd_pin(path: &Path) -> I2pResult<()> {
+    if cfg!(debug_assertions) && std::env::var_os("WHISPER_I2PD_BINARY").is_some() {
+        tracing::info!(
+            "i2p: pin check skipped (WHISPER_I2PD_BINARY override, debug build)"
+        );
+        return Ok(());
+    }
+    if I2PD_BUNDLE_MANIFEST.is_empty() {
+        if !cfg!(debug_assertions) {
+            return Err(I2pError::Subprocess(
+                "i2pd bundle manifest missing in release build — refusing \
+                 to spawn an unverified subprocess. Re-run \
+                 scripts/bundle-i2pd.sh and rebuild."
+                    .into(),
+            ));
+        }
+        tracing::warn!(
+            "i2p: pin manifest not embedded at build time — skipping integrity check (debug only)"
+        );
+        return Ok(());
+    }
+
+    // The manifest's relative paths are anchored at the bundle root.
+    // Determine that root from the i2pd binary path the caller passed:
+    // e.g. `/.../Contents/Resources/i2pd-bundle/i2pd` → `i2pd-bundle/`.
+    let bundle_root = path.parent().ok_or_else(|| {
+        I2pError::Subprocess("i2pd path has no parent directory".into())
+    })?;
+
+    // Debug-mode safety net: if `locate_i2pd_binary` fell through to a
+    // homebrew install (no companion `lib/` next to the binary), the
+    // manifest walk will fail on the very first dylib lookup. Detect
+    // that case and skip the pin check with a clear log line, rather
+    // than failing the whole spawn. Release builds NEVER reach this
+    // path — `locate_i2pd_binary` won't return a brew binary in
+    // release, and a missing bundle would have already errored above.
+    if cfg!(debug_assertions) && !bundle_root.join("lib").is_dir() {
+        tracing::warn!(
+            "i2p: pin check skipped — i2pd at {} has no sibling lib/ \
+             (debug build, likely a homebrew binary). To verify the pin \
+             in dev, run scripts/bundle-i2pd.sh so a project-local \
+             i2pd-bundle/ exists.",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let mut verified: usize = 0;
+    for (rel, expected_hex) in I2PD_BUNDLE_MANIFEST.iter() {
+        let abs = bundle_root.join(rel);
+        let bytes = std::fs::read(&abs).map_err(|e| {
+            I2pError::Subprocess(format!(
+                "i2pd pin: cannot read {} ({e})",
+                abs.display()
+            ))
+        })?;
+        let actual = sha256_hex(&bytes);
+        if actual.as_str() != *expected_hex {
+            tracing::error!(
+                "i2p: pin mismatch on `{}` — refusing to spawn. expected={}, actual={}",
+                rel,
+                expected_hex,
+                actual
+            );
+            return Err(I2pError::Subprocess(format!(
+                "i2pd bundle integrity check failed for {} \
+                 (expected {}, got {})",
+                rel, expected_hex, actual
+            )));
+        }
+        verified += 1;
+    }
+    tracing::info!(
+        "i2p: pin verified ({} files, including dylibs and certs)",
+        verified
+    );
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
 }
 
 /// Pick an unused TCP port on 127.0.0.1. The kernel hands us one when we
@@ -158,6 +295,44 @@ pub struct I2pConfig {
     /// other I2P users). Default `false` per Mod #1; Phase 10 onboarding
     /// flips this to true after the user opts in.
     pub enable_transit: bool,
+}
+
+/// Phase-A pre-start state: i2pd subprocess up, SAM bridge ready, NetDB
+/// reseeded, but no destination has been minted yet and no SAM session
+/// exists. Held during the window between app launch and vault unlock
+/// so the user's typing time covers the slowest part of cold-start.
+///
+/// Privacy guarantee: a `PreStartedI2pd` is **not observable** to peers
+/// who know our destination. Only the master STREAM session created in
+/// `finalize` publishes the leaseset to floodfill peers — until then,
+/// i2pd is just an anonymous router building outbound tunnels for
+/// nobody in particular.
+///
+/// `kill_on_drop` semantics on `child`: if the user closes the app
+/// before unlocking, this struct is dropped and i2pd is reaped.
+pub struct PreStartedI2pd {
+    pub(crate) child: Child,
+    pub(crate) log_path: PathBuf,
+    pub(crate) sam_addr: String,
+}
+
+impl PreStartedI2pd {
+    /// SAM bridge address for the running i2pd subprocess.
+    pub fn sam_addr(&self) -> &str {
+        &self.sam_addr
+    }
+
+    /// Take ownership and kill the subprocess. Use this on app shutdown
+    /// when the vault was never unlocked, so we don't leak an orphan.
+    pub async fn shutdown(mut self) {
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
+        let _ = self.child.kill().await;
+    }
 }
 
 /// Active i2pd subprocess + the master STREAM session that all Whisper
@@ -195,8 +370,22 @@ impl I2PManager {
     /// `commands::spawn_i2p_start`) so the start future is `Send`.
     /// Connection is Send-but-not-Sync, so owning it in a future works
     /// where `&Database` would not.
-    pub async fn start(db: Database, cfg: I2pConfig) -> I2pResult<Self> {
+    /// Phase A: spawn i2pd and wait for the SAM bridge to come up.
+    ///
+    /// This is the slow part of cold start (~10-30s reseed + ~10-30s
+    /// tunnel build on a fresh datadir). It does NOT touch the DB —
+    /// no destination is minted, no SAM session is created, no
+    /// leaseset is published. Safe to run before vault unlock so the
+    /// user's typing time overlaps with the network warm-up.
+    ///
+    /// On success: returns a `PreStartedI2pd` holding the running
+    /// subprocess and SAM address. Hand it to [`Self::finalize`]
+    /// after vault unlock to mint the destination and create the
+    /// master STREAM session. If the user closes the app without
+    /// unlocking, drop the `PreStartedI2pd` (kill_on_drop reaps i2pd).
+    pub async fn pre_start(cfg: I2pConfig) -> I2pResult<PreStartedI2pd> {
         let bin = locate_i2pd_binary()?;
+        verify_i2pd_pin(&bin)?;
         tracing::info!("i2p: using binary {}", bin.display());
 
         let i2p_dir = cfg.profile_dir.join("i2p");
@@ -250,6 +439,16 @@ impl I2PManager {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
+            // M-20: don't inherit the parent's env. i2pd respects
+            // HTTP_PROXY/HTTPS_PROXY for reseed downloads; if a user has
+            // those set (or an attacker plants them in a shell rc) the
+            // first-launch reseed traffic could be MITM'd. We re-supply
+            // only the variables i2pd actually needs — `HOME` (for any
+            // libc calls that resolve a fallback config) and `PATH`
+            // limited to system locations.
+            .env_clear()
+            .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| I2pError::Subprocess(format!("spawn i2pd: {e}")))?;
@@ -278,7 +477,28 @@ impl I2PManager {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        tracing::info!("i2p: SAM ready at {sam_addr}");
+        tracing::info!("i2p: SAM ready at {sam_addr} (pre-start complete)");
+
+        Ok(PreStartedI2pd {
+            child,
+            log_path,
+            sam_addr,
+        })
+    }
+
+    /// Phase B: mint or load the destination from the now-unlocked DB,
+    /// then create the master STREAM session (which publishes our
+    /// leaseset to floodfill peers — i.e. announces "this destination
+    /// is online" to the network).
+    ///
+    /// Must be called with a `PreStartedI2pd` from [`Self::pre_start`]
+    /// and an unlocked `Database`. Returns a fully ready `I2PManager`.
+    pub async fn finalize(pre: PreStartedI2pd, db: Database) -> I2pResult<Self> {
+        let PreStartedI2pd {
+            child,
+            log_path,
+            sam_addr,
+        } = pre;
 
         // Wrap the owned DB in a Mutex so the destination calls can
         // hold a `&Mutex<Database>` (Sync) across their `.await`s.
@@ -321,6 +541,14 @@ impl I2PManager {
         })
     }
 
+    /// Convenience: pre_start then finalize back-to-back. Kept for
+    /// callers that have an unlocked DB up-front and don't care about
+    /// the pre-warm split (e.g. integration tests).
+    pub async fn start(db: Database, cfg: I2pConfig) -> I2pResult<Self> {
+        let pre = Self::pre_start(cfg).await?;
+        Self::finalize(pre, db).await
+    }
+
     /// Our public I2P destination (base64). Share this with peers via
     /// the signed contact bundle so they can reach us.
     pub fn destination_pub(&self) -> &str {
@@ -343,6 +571,14 @@ impl I2PManager {
     /// dashboard for diagnostics (Phase 11).
     pub fn log_path(&self) -> &Path {
         &self.log_path
+    }
+
+    /// PID of the i2pd subprocess we spawned, if it's alive. The egress
+    /// audit reads this so it can enumerate i2pd's sockets in a separate
+    /// pane (i2pd legitimately has many remote peers — they're shown
+    /// for transparency, not flagged as anomalies).
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.id()
     }
 
     /// Borrow the secondary DB Mutex. Used by the queue worker so it
@@ -550,6 +786,11 @@ mod tests {
         assert!(body.contains("port = 12345"));
     }
 
+    // The env override is a debug-only affordance per HIGH-3 — release
+    // builds intentionally ignore WHISPER_I2PD_BINARY so a planted env
+    // var can't redirect a signed app to a malicious binary. The test
+    // only makes sense for the debug branch.
+    #[cfg(debug_assertions)]
     #[test]
     fn locate_binary_respects_env_override() {
         // Use the actual i2pd binary if present so this test passes
@@ -562,6 +803,75 @@ mod tests {
         let p = locate_i2pd_binary().unwrap();
         assert_eq!(p, std::path::PathBuf::from(candidate));
         std::env::remove_var("WHISPER_I2PD_BINARY");
+    }
+
+    /// NEW-3 regression: verify_i2pd_pin must catch byte-tampering of any
+    /// file in the bundle (not just the i2pd executable). Tampers a dylib
+    /// and a certificate in turn and confirms each yields a diagnostic
+    /// rejection. Skipped in debug because the manifest may be empty.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn verify_i2pd_pin_catches_dylib_tampering() {
+        // Copy the real bundle to a tempdir so we can mutate without
+        // racing with a real launch.
+        let src = std::path::Path::new("i2pd-bundle");
+        if !src.is_dir() {
+            return; // dev cargo without bundle staged — nothing to test
+        }
+        let dst = tempdir();
+        copy_dir_all(src, &dst).unwrap();
+
+        let i2pd = dst.join("i2pd");
+        // Sanity: clean pin passes.
+        verify_i2pd_pin(&i2pd).expect("clean bundle should verify");
+
+        // Tamper a dylib (1 byte at the file's 0x100 offset).
+        let target = dst.join("lib/libcrypto.3.dylib");
+        if target.is_file() {
+            let mut bytes = std::fs::read(&target).unwrap();
+            bytes[0x100] ^= 0xFF;
+            std::fs::write(&target, &bytes).unwrap();
+            let err = verify_i2pd_pin(&i2pd).expect_err("tampered dylib must fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("lib/libcrypto.3.dylib"),
+                "diagnostic should name the offending file; got: {msg}"
+            );
+            assert!(msg.to_ascii_lowercase().contains("integrity"));
+            // Restore for the cert tampering branch.
+            bytes[0x100] ^= 0xFF;
+            std::fs::write(&target, &bytes).unwrap();
+            verify_i2pd_pin(&i2pd).expect("restored dylib should verify");
+        }
+
+        // Tamper a reseed cert.
+        let cert = dst.join("certificates/reseed/i2p-reseed_at_mk16.de.crt");
+        if cert.is_file() {
+            let mut cb = std::fs::read(&cert).unwrap();
+            cb[0] ^= 0xFF;
+            std::fs::write(&cert, &cb).unwrap();
+            let err = verify_i2pd_pin(&i2pd).expect_err("tampered cert must fail");
+            assert!(
+                err.to_string().contains("certificates/reseed/i2p-reseed_at_mk16.de.crt"),
+                "diagnostic should name the cert"
+            );
+        }
+    }
+
+    fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let ty = entry.file_type()?;
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if ty.is_dir() {
+                copy_dir_all(&from, &to)?;
+            } else if ty.is_file() {
+                std::fs::copy(&from, &to)?;
+            }
+        }
+        Ok(())
     }
 
     fn tempdir() -> std::path::PathBuf {

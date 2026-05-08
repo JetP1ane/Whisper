@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { EmojiPicker } from "./EmojiPicker";
 
 interface Props {
   onSend: (text: string, detonateSecs: number | null) => void;
@@ -25,8 +26,29 @@ export function ComposeBar({ onSend, onSendAttachment }: Props) {
   const [attachError, setAttachError] = useState<string | null>(null);
   const [detonateSecs, setDetonateSecs] = useState<number | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [emojiOpen, setEmojiOpen] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  const insertEmoji = (e: string) => {
+    const ta = ref.current;
+    if (!ta) {
+      setText((t) => t + e);
+      return;
+    }
+    const start = ta.selectionStart ?? text.length;
+    const end = ta.selectionEnd ?? text.length;
+    const next = text.slice(0, start) + e + text.slice(end);
+    setText(next);
+    // Restore caret to right after the inserted emoji on next paint.
+    requestAnimationFrame(() => {
+      if (ref.current) {
+        const pos = start + e.length;
+        ref.current.focus();
+        ref.current.setSelectionRange(pos, pos);
+      }
+    });
+  };
 
   const submit = () => {
     if (!text.trim()) return;
@@ -96,10 +118,31 @@ export function ComposeBar({ onSend, onSendAttachment }: Props) {
           onClick={onAttach}
           disabled={attaching || !onSendAttachment}
           className="btn-ghost p-1 text-text-tertiary hover:text-text-secondary disabled:opacity-40"
-          title={attaching ? "Encrypting attachment…" : "Attach file (max 10 MB)"}
+          title={
+            attaching
+              ? "Encrypting attachment…"
+              : "Attach file or GIF (max 10 MB)"
+          }
         >
           <PaperclipIcon />
         </button>
+        <div className="relative">
+          <button
+            onClick={() => setEmojiOpen((v) => !v)}
+            className={`btn-ghost p-1 hover:text-text-secondary ${
+              emojiOpen ? "text-accent-400" : "text-text-tertiary"
+            }`}
+            title="Insert emoji"
+          >
+            <SmileyIcon />
+          </button>
+          {emojiOpen && (
+            <EmojiPicker
+              onPick={(e) => insertEmoji(e)}
+              onClose={() => setEmojiOpen(false)}
+            />
+          )}
+        </div>
         <div className="relative" ref={menuRef}>
           <button
             onClick={() => setMenuOpen((v) => !v)}
@@ -161,6 +204,17 @@ function PaperclipIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="m21 12-9.5 9.5a5 5 0 0 1-7.07-7.07L13.5 5a3.5 3.5 0 0 1 4.95 4.95l-8.49 8.49a2 2 0 0 1-2.83-2.83L14 8" />
+    </svg>
+  );
+}
+
+function SmileyIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M8 14s1.5 2 4 2 4-2 4-2" />
+      <line x1="9" y1="9" x2="9.01" y2="9" />
+      <line x1="15" y1="9" x2="15.01" y2="9" />
     </svg>
   );
 }

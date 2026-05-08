@@ -1,7 +1,11 @@
 /**
- * Noctis owl mark — converted from `public/noctis_owl.xml` Android vector
- * drawable. Uses `currentColor` so it picks up its container's text color
- * automatically (black on light mode, near-white on dark mode).
+ * Noctis Whisper icon — centered amber bar flanked by mirrored fading
+ * gray waveform bars. The black rounded-rect background is rendered
+ * unconditionally but hidden in light mode via a CSS rule keyed on
+ * `:root.light` (see globals.css). Using CSS instead of a React state
+ * read avoids the per-component-state fragmentation of `useTheme()` —
+ * every NoctisOwl instance reacts to a theme toggle without needing
+ * to be in the same React subtree as the theme button.
  */
 export function NoctisOwl({
   size = 16,
@@ -13,13 +17,37 @@ export function NoctisOwl({
   return (
     <svg
       width={size}
-      height={(size * 125) / 100}
-      viewBox="0 0 100 125"
-      fill="currentColor"
+      height={size}
+      viewBox="0 0 1024 1024"
       className={className}
-      aria-label="Noctis"
+      aria-label="Noctis Whisper"
+      role="img"
     >
-      <path d="M93.57,72.93v-60.9l-0.86,0.01c0,0,0,0.14,0,0.14c0,10.15,-4.38,19.69,-12.35,26.88c-4.23,3.82,-9.2,6.73,-14.62,8.63q-1.41,0.36,-2.75,0.87c-4.06,1.14,-8.33,1.73,-12.7,1.73c-11.33,0,-22.02,-3.98,-30.11,-11.21c-8.07,-7.21,-12.62,-16.83,-12.81,-27.08l-0.7,0.04v64.26c0.72,12.03,10.79,21.6,23.01,21.6q2.91,-0.01,5.62,-0.7c0.16,-0.04,14.85,14.84,14.85,14.84l14.85,-14.85c0,0,3.5,0.71,5.63,0.71c12.68,0,22.94,-10.32,22.94,-23c0,-0.67,0.05,-1.32,0,-1.97zM29.67,92.86c-9.89,0,-17.94,-8.05,-17.94,-17.95q0,-1.86,0.37,-3.61c1.67,-8.18,8.92,-14.35,17.58,-14.35c9.89,0,17.94,8.05,17.94,17.94q0,0.01,0,0.01q0,0,0,0q0,1.86,-0.37,3.62c-1.67,8.17,-8.92,14.34,-17.58,14.34zM50.15,104.89c-1.98,-1.98,-7.17,-7.17,-9.69,-9.68c4.15,-2.22,7.54,-5.66,9.69,-9.85c2.15,4.19,5.54,7.63,9.68,9.84c-2.51,2.52,-7.7,7.71,-9.68,9.69zM70.62,92.86c-9.89,0,-17.94,-8.05,-17.94,-17.95q0,-2.07,0.45,-4.02c1.29,-5.61,5.21,-10.23,10.39,-12.47q1.17,-0.37,2.32,-0.81q2.29,-0.65,4.79,-0.66c9.28,0,16.95,7.1,17.85,16.16c0,1.09,0.09,1.76,0.09,1.79q0,1.86,-0.37,3.62c-1.67,8.17,-8.92,14.34,-17.58,14.34z" />
+      {/* Black rounded-rect background — hidden in light mode by CSS. */}
+      <g className="whisper-icon-tile">
+        <rect width="1024" height="1024" rx="220" fill="#000000" />
+        <rect
+          x="1.5"
+          y="1.5"
+          width="1021"
+          height="1021"
+          rx="218.5"
+          stroke="#151515"
+          strokeWidth="3"
+        />
+      </g>
+
+      {/* Waveform bars */}
+      <rect x="173" y="456" width="50" height="114" rx="25" fill="#D7D7D7" />
+      <rect x="274" y="389" width="50" height="246" rx="25" fill="#BDBDBD" />
+      <rect x="380" y="309" width="50" height="408" rx="25" fill="#8F8F8F" />
+
+      {/* Center amber bar */}
+      <rect x="486" y="222" width="52" height="580" rx="26" fill="#F6B32D" />
+
+      <rect x="594" y="309" width="50" height="408" rx="25" fill="#8F8F8F" />
+      <rect x="700" y="389" width="50" height="246" rx="25" fill="#BDBDBD" />
+      <rect x="801" y="456" width="50" height="114" rx="25" fill="#D7D7D7" />
     </svg>
   );
 }

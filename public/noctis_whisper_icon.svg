@@ -1,0 +1,21 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1024" height="1024" rx="220" fill="#000000"/>
+  <!-- subtle app icon boundary, matching the generated icon's barely-visible rounded outline -->
+  <rect x="1.5" y="1.5" width="1021" height="1021" rx="218.5" stroke="#151515" stroke-width="3"/>
+
+  <!-- Whisper waveform bars -->
+  <g>
+    <!-- left fading bars -->
+    <rect x="173" y="456" width="50" height="114" rx="25" fill="#D7D7D7"/>
+    <rect x="274" y="389" width="50" height="246" rx="25" fill="#BDBDBD"/>
+    <rect x="380" y="309" width="50" height="408" rx="25" fill="#8F8F8F"/>
+
+    <!-- center amber bar -->
+    <rect x="486" y="222" width="52" height="580" rx="26" fill="#F6B32D"/>
+
+    <!-- right fading bars -->
+    <rect x="594" y="309" width="50" height="408" rx="25" fill="#8F8F8F"/>
+    <rect x="700" y="389" width="50" height="246" rx="25" fill="#BDBDBD"/>
+    <rect x="801" y="456" width="50" height="114" rx="25" fill="#D7D7D7"/>
+  </g>
+</svg>

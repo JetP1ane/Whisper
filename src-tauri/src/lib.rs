@@ -9,6 +9,7 @@ pub mod db;
 pub mod identity;
 pub mod messaging;
 pub mod profile;
+pub mod security;
 pub mod state;
 pub mod transport;
 
@@ -47,12 +48,14 @@ pub fn run() {
             // conversations + messages
             commands::conversation_list,
             commands::conversation_open,
+            commands::conversation_mark_read,
             commands::conversation_messages,
             commands::conversation_security_summary,
             commands::conversation_set_disappear,
             commands::message_send,
             commands::message_send_detonating,
             commands::message_send_attachment,
+            commands::message_react,
             commands::room_create,
             commands::room_send,
             commands::attachment_load_data_url,
@@ -67,6 +70,7 @@ pub fn run() {
             commands::notifications_test,
             // dashboard
             commands::security_status,
+            commands::egress_audit,
         ])
         .setup(|app| {
             // Profile-scoped data directory: lets multiple instances run
@@ -88,13 +92,21 @@ pub fn run() {
             // `manage` requires `Send + Sync + 'static` — pass the shared
             // Arc so the StateManager and the OnceCell point at the same
             // backing AppState (commands and the pump observe identical
-            // vault state, identity, and relay client).
-            app.manage(arc);
+            // vault state, identity, and relay client). Clone so we can
+            // hand a copy to the pre-warm setup further down.
+            app.manage(arc.clone());
 
+            // Devtools auto-open is opt-in. Default-on was annoying for
+            // hands-on dual-window testing; set WHISPER_OPEN_DEVTOOLS=1
+            // when you actually want the inspector at launch. Devtools
+            // are still compiled in for debug builds, so right-click ->
+            // Inspect Element keeps working without the env var.
             #[cfg(debug_assertions)]
             {
-                if let Some(window) = app.get_webview_window("main") {
-                    window.open_devtools();
+                if std::env::var_os("WHISPER_OPEN_DEVTOOLS").is_some() {
+                    if let Some(window) = app.get_webview_window("main") {
+                        window.open_devtools();
+                    }
                 }
             }
             // Log to a per-profile file so we can debug the release build.
@@ -128,6 +140,52 @@ pub fn run() {
             // explicit Quit from the tray actually exits.
             install_tray(app)?;
 
+            // I2P pre-warm: kick off i2pd subprocess + reseed + outbound
+            // tunnel build *now*, while the user is still typing their
+            // passphrase. Phase A doesn't touch the DB and doesn't
+            // publish our destination — those wait for vault unlock —
+            // so this is privacy-safe. By the time `vault_unlock` fires
+            // it grabs the pre-warmed handle and only has to do the
+            // ~3-5s SAM-session-create dance, not the 30-90s cold path.
+            //
+            // If the user closes the app without unlocking, the prewarm
+            // slot drops on shutdown and i2pd is reaped via kill_on_drop.
+            let prewarm_state = std::sync::Arc::clone(&arc);
+            // Use `tauri::async_runtime::spawn` rather than `tokio::spawn`:
+            // the setup callback fires before the tokio runtime context
+            // is attached to this thread, so a bare tokio::spawn panics
+            // with "no reactor running". Tauri's runtime handle is
+            // already initialized at this point and queues the future
+            // for the runtime that takes over a few ms later.
+            let handle = tauri::async_runtime::spawn(async move {
+                let profile_dir = profile::data_dir();
+                let enable_transit = false; // mirrors the unlock-path default
+                tracing::info!("i2p: starting pre-warm (phase A)");
+                match crate::transport::i2p::lifecycle::pre_start(
+                    profile_dir,
+                    enable_transit,
+                )
+                .await
+                {
+                    Ok(pre) => {
+                        tracing::info!(
+                            "i2p: pre-warm complete (sam={}); waiting for vault unlock",
+                            pre.sam_addr()
+                        );
+                        let mut slot = prewarm_state.i2p_prewarm.lock().await;
+                        *slot = Some(pre);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "i2p: pre-warm failed: {e:#} — vault_unlock will fall back to the cold path"
+                        );
+                    }
+                }
+            });
+            // Hand the JoinHandle to vault_unlock so it can await
+            // pre-warm completion before deciding warm-vs-cold path.
+            *arc.i2p_prewarm_handle.lock() = Some(handle);
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -156,6 +214,14 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
 
     TrayIconBuilder::with_id("noctis-whisper-tray")
+        // Render the Whisper waveform directly into an RGBA buffer. We
+        // mirror the geometry of public/noctis_whisper_icon.svg but
+        // strip the colour — macOS template-image semantics replace the
+        // RGB with the system tint (white in dark menu bars, black in
+        // light, dimmed when the app is inactive). The varying alpha
+        // recreates the centre-emphasised fade of the brand mark.
+        .icon(build_tray_template_icon())
+        .icon_as_template(true)
         .tooltip("Noctis Whisper")
         .menu(&menu)
         .show_menu_on_left_click(false)
@@ -185,4 +251,54 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         })
         .build(app)?;
     Ok(())
+}
+
+/// Build the menubar tray icon as a 88×88 RGBA bitmap, matching the
+/// 7-bar Whisper waveform from `public/noctis_whisper_icon.svg` but
+/// with all colour stripped — pure black with per-bar alpha. Set as
+/// a macOS template image, the OS handles tinting:
+///   * dark menu bar → white bars
+///   * light menu bar → black bars
+///   * app inactive → dimmed
+///
+/// 88×88 is a 4× supersample of the 22pt menubar slot; macOS scales
+/// down with antialiasing so the bars stay crisp on retina displays.
+/// We use programmatic drawing rather than baking out a PNG so the
+/// icon ships in the binary with no external converter dependency
+/// (resvg / librsvg / ImageMagick) and no checked-in raster asset.
+fn build_tray_template_icon() -> tauri::image::Image<'static> {
+    const W: u32 = 88;
+    const H: u32 = 88;
+    let mut rgba = vec![0u8; (W * H * 4) as usize];
+
+    // Bar geometry, scaled from the 1024-unit source viewBox at
+    // factor 88/1024 ≈ 0.086. Alpha values match the source's
+    // luminance progression (lightest outer bars at 0xD7 → mid
+    // outer at 0xBD → inner at 0x8F → centre at full opacity).
+    let bars: &[(u32, u32, u32, u32, u8)] = &[
+        // (x, y, width, height, alpha)
+        (15, 39, 4, 10, 0xD7),
+        (24, 33, 4, 21, 0xBD),
+        (33, 27, 4, 35, 0x8F),
+        (42, 19, 4, 50, 0xFF), // centre bar
+        (51, 27, 4, 35, 0x8F),
+        (60, 33, 4, 21, 0xBD),
+        (69, 39, 4, 10, 0xD7),
+    ];
+
+    for &(bx, by, bw, bh, alpha) in bars {
+        for y in by..(by + bh) {
+            for x in bx..(bx + bw) {
+                let i = ((y * W + x) * 4) as usize;
+                // Black RGB; alpha carries the brand fade. macOS
+                // replaces RGB with the menubar tint at render time.
+                rgba[i] = 0;
+                rgba[i + 1] = 0;
+                rgba[i + 2] = 0;
+                rgba[i + 3] = alpha;
+            }
+        }
+    }
+
+    tauri::image::Image::new_owned(rgba, W, H)
 }

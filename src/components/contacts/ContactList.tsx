@@ -21,7 +21,7 @@ export function ContactList() {
           key={c.id}
           onClick={() => select(c.id)}
           className={`flex items-center gap-2 px-3 py-2 rounded-md text-left
-            ${selectedId === c.id ? "bg-bg-active" : "hover:bg-bg-hover"}`}
+            ${selectedId === c.id ? "bg-gray-800" : "hover:bg-bg-hover"}`}
         >
           <Avatar alias={label} />
           <div className="flex-1 min-w-0">

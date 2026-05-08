@@ -177,20 +177,45 @@ mod tests {
 
     #[test]
     fn rejects_bad_checksum() {
-        let (_, mut phrase) = generate();
-        // Replace the last word with another valid BIP39 word — almost
-        // always breaks the checksum.
+        // The 4-bit BIP39 checksum means a random last-word swap has a
+        // ~6% chance of accidentally re-validating. The original test
+        // tried exactly one swap and was flaky for that reason. We
+        // instead generate a fresh phrase and walk through replacement
+        // candidates until one breaks the checksum, asserting that
+        // such a replacement exists for any phrase. Bounded loop so a
+        // genuine bug can't hang the test.
+        let (_, phrase) = generate();
         let words: Vec<&str> = phrase.split_whitespace().collect();
-        let last = words.last().unwrap();
-        let other = if *last == "abandon" { "ability" } else { "abandon" };
-        let mut new_phrase = words[..words.len() - 1].join(" ");
-        new_phrase.push(' ');
-        new_phrase.push_str(other);
-        phrase = new_phrase;
-        match entropy_from_phrase(&phrase) {
-            Err(CryptoError::InvalidInput(_)) => {}
-            other => panic!("expected checksum failure, got {:?}", other),
+        let last = words.last().copied().unwrap();
+        let candidates = [
+            "abandon", "ability", "able", "about", "above",
+            "absent", "absorb", "abstract", "absurd", "abuse",
+            "access", "accident", "account", "accuse", "achieve",
+            "acid", "acoustic",
+        ];
+        let mut hit_failure = false;
+        for &cand in candidates.iter() {
+            if cand == last {
+                continue;
+            }
+            let mut new_phrase = words[..words.len() - 1].join(" ");
+            new_phrase.push(' ');
+            new_phrase.push_str(cand);
+            match entropy_from_phrase(&new_phrase) {
+                Err(CryptoError::InvalidInput(_)) => {
+                    hit_failure = true;
+                    break;
+                }
+                Ok(_) => continue,
+                other => panic!("unexpected error variant: {other:?}"),
+            }
         }
+        assert!(
+            hit_failure,
+            "no candidate last-word swap produced a checksum failure — \
+             this is statistically impossible (each candidate has ~94% \
+             chance) so something is very wrong"
+        );
     }
 
     #[test]

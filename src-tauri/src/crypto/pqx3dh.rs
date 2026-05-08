@@ -14,6 +14,28 @@
 //! ```
 //!
 //! Domain strings live in [`super::X3DH_SALT`] / [`super::X3DH_INFO`].
+//!
+//! Known hardening gap (M-2/M-3, deferred to a protocol-bump release):
+//!
+//! The IKM transcript currently binds the X25519 identity keys *only via
+//! their use inside dh1/dh2*. The Ed25519 identity keys are not in the
+//! transcript, nor are the KEM ciphertexts or SPK/OTPK IDs. Adding
+//! `IK_alice_ed25519 || IK_bob_ed25519 || kem1_ct || kem2_ct || spk_id ||
+//! otpk_id` to the IKM would close two narrow gaps:
+//!   1. An attacker who learns one of Bob's X25519 identity keys (without
+//!      learning the Ed25519 identity that derives the alias) cannot
+//!      currently be detected by the transcript — adding the Ed25519
+//!      key forces the alias-binding into the master derivation.
+//!   2. A KEM-ciphertext substitution by a MITM (e.g., re-using a
+//!      replayed kem1_ct against a still-valid SPK) would change the
+//!      transcript hash and fail.
+//!
+//! This change is **deferred** because the wire format (and therefore
+//! the IKM byte order) is shared byte-for-byte with the Android client
+//! — see [`pack_session_init`]. Applying it desktop-only would silently
+//! fork session-init compatibility. The fix requires a coordinated
+//! version-bumped release across both clients with a v4-vs-v5 bundle
+//! tag selecting the binding mode.
 
 use super::{CryptoError, CryptoResult, X3DH_INFO, X3DH_SALT};
 use hkdf::Hkdf;

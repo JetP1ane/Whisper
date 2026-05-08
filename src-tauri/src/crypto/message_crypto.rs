@@ -29,7 +29,8 @@
 use super::{
     CryptoError, CryptoResult, MAX_ATTACHMENT_BYTES, TYPE_FLAG_ATTACHMENT,
     TYPE_FLAG_DELIVERY_RECEIPT, TYPE_FLAG_DETONATING_TEXT, TYPE_FLAG_RELAY_UPDATE,
-    TYPE_FLAG_ROOM_INVITE, TYPE_FLAG_ROOM_SENDER_KEY, TYPE_FLAG_TEXT, WIRE_MESSAGE_SIZE,
+    TYPE_FLAG_MESSAGE_REACTION, TYPE_FLAG_ROOM_INVITE, TYPE_FLAG_ROOM_SENDER_KEY,
+    TYPE_FLAG_ROOM_SENDER_KEY_ACK, TYPE_FLAG_TEXT, WIRE_MESSAGE_SIZE,
 };
 
 #[cfg(test)]
@@ -110,12 +111,32 @@ pub enum DecodedEnvelope {
         name: String,
         description: String,
         owner_chain_seed: [u8; 32],
-        member_pubkeys: Vec<[u8; 32]>,
+        /// Full signed bundles for every member (including the owner
+        /// and the recipient). The recipient parses these, persists
+        /// each unknown peer as a contact, and uses each peer's
+        /// destination + prekeys to bootstrap a fresh pairwise
+        /// Double Ratchet for the room sender-key share.
+        ///
+        /// We carry the entire bundle (not just the pubkey) so non-
+        /// owner members can reach each other without a separate
+        /// directory or relay lookup — without this, only the owner
+        /// can decrypt every member's messages.
+        member_bundles: Vec<Vec<u8>>,
     },
     RoomSenderKey {
         timestamp_ms: u64,
         room_id: [u8; 16],
         chain_seed: [u8; 32],
+    },
+    RoomSenderKeyAck {
+        timestamp_ms: u64,
+        room_id: [u8; 16],
+    },
+    MessageReaction {
+        timestamp_ms: u64,
+        target_wire_hash: [u8; 32],
+        remove: bool,
+        emoji: String,
     },
     DetonatingText {
         timestamp_ms: u64,
@@ -151,23 +172,29 @@ pub fn build_relay_update_envelope(timestamp_ms: u64, new_relay_url: &str) -> Ve
 /// Build a room-invite envelope:
 /// `[8B ts][1B 0x04][16B room_id][32B owner_chain_seed]
 ///  [2B name_len][name][2B desc_len][desc]
-///  [2B member_count][per-member: 32B contact_ed25519_pub]`.
+///  [2B member_count][per-member: 4B bundle_len BE][bundle_bytes]`.
+///
+/// The per-member field is the full signed bundle (~4KB each) so the
+/// recipient can persist every other member as a contact and run
+/// X3DH against them — without that, non-owner members can't reach
+/// each other and only the owner sees everyone's messages.
 pub fn build_room_invite_envelope(
     timestamp_ms: u64,
     room_id: &[u8; 16],
     name: &str,
     description: &str,
     owner_chain_seed: &[u8; 32],
-    member_pubkeys: &[[u8; 32]],
+    member_bundles: &[&[u8]],
 ) -> CryptoResult<Vec<u8>> {
     if name.len() > u16::MAX as usize
         || description.len() > u16::MAX as usize
-        || member_pubkeys.len() > u16::MAX as usize
+        || member_bundles.len() > u16::MAX as usize
     {
         return Err(CryptoError::InvalidInput("room invite field too large"));
     }
+    let bundles_size: usize = member_bundles.iter().map(|b| 4 + b.len()).sum();
     let mut buf = Vec::with_capacity(
-        8 + 1 + 16 + 32 + 2 + name.len() + 2 + description.len() + 2 + 32 * member_pubkeys.len(),
+        8 + 1 + 16 + 32 + 2 + name.len() + 2 + description.len() + 2 + bundles_size,
     );
     buf.extend_from_slice(&timestamp_ms.to_be_bytes());
     buf.push(TYPE_FLAG_ROOM_INVITE);
@@ -177,9 +204,13 @@ pub fn build_room_invite_envelope(
     buf.extend_from_slice(name.as_bytes());
     buf.extend_from_slice(&(description.len() as u16).to_be_bytes());
     buf.extend_from_slice(description.as_bytes());
-    buf.extend_from_slice(&(member_pubkeys.len() as u16).to_be_bytes());
-    for m in member_pubkeys {
-        buf.extend_from_slice(m);
+    buf.extend_from_slice(&(member_bundles.len() as u16).to_be_bytes());
+    for bundle in member_bundles {
+        if bundle.len() > u32::MAX as usize {
+            return Err(CryptoError::InvalidInput("room invite bundle too large"));
+        }
+        buf.extend_from_slice(&(bundle.len() as u32).to_be_bytes());
+        buf.extend_from_slice(bundle);
     }
     Ok(buf)
 }
@@ -197,6 +228,40 @@ pub fn build_room_sender_key_envelope(
     buf.extend_from_slice(room_id);
     buf.extend_from_slice(chain_seed);
     buf
+}
+
+/// Build an ACK for a previously-received `RoomSenderKey`:
+/// `[8B ts][1B 0x07][16B room_id]`.
+pub fn build_room_sender_key_ack_envelope(
+    timestamp_ms: u64,
+    room_id: &[u8; 16],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + 1 + 16);
+    buf.extend_from_slice(&timestamp_ms.to_be_bytes());
+    buf.push(TYPE_FLAG_ROOM_SENDER_KEY_ACK);
+    buf.extend_from_slice(room_id);
+    buf
+}
+
+/// Build an emoji reaction envelope:
+/// `[8B ts][1B 0x08][32B target_wire_hash][1B remove_flag][2B emoji_len][emoji UTF-8]`.
+pub fn build_message_reaction_envelope(
+    timestamp_ms: u64,
+    target_wire_hash: &[u8; 32],
+    remove: bool,
+    emoji: &str,
+) -> CryptoResult<Vec<u8>> {
+    if emoji.len() > u16::MAX as usize {
+        return Err(CryptoError::InvalidInput("reaction emoji too large"));
+    }
+    let mut buf = Vec::with_capacity(8 + 1 + 32 + 1 + 2 + emoji.len());
+    buf.extend_from_slice(&timestamp_ms.to_be_bytes());
+    buf.push(TYPE_FLAG_MESSAGE_REACTION);
+    buf.extend_from_slice(target_wire_hash);
+    buf.push(if remove { 1 } else { 0 });
+    buf.extend_from_slice(&(emoji.len() as u16).to_be_bytes());
+    buf.extend_from_slice(emoji.as_bytes());
+    Ok(buf)
 }
 
 pub fn decode_envelope(env: &[u8]) -> CryptoResult<DecodedEnvelope> {
@@ -305,15 +370,19 @@ pub fn decode_envelope(env: &[u8]) -> CryptoResult<DecodedEnvelope> {
             p += desc_len;
             let count = u16::from_be_bytes(payload[p..p + 2].try_into().unwrap()) as usize;
             p += 2;
-            if payload.len() < p + 32 * count {
-                return Err(CryptoError::Decode("room invite member list truncated"));
-            }
-            let mut member_pubkeys = Vec::with_capacity(count);
+            let mut member_bundles: Vec<Vec<u8>> = Vec::with_capacity(count);
             for _ in 0..count {
-                let mut pk = [0u8; 32];
-                pk.copy_from_slice(&payload[p..p + 32]);
-                member_pubkeys.push(pk);
-                p += 32;
+                if payload.len() < p + 4 {
+                    return Err(CryptoError::Decode("room invite bundle len truncated"));
+                }
+                let blen =
+                    u32::from_be_bytes(payload[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                if payload.len() < p + blen {
+                    return Err(CryptoError::Decode("room invite bundle truncated"));
+                }
+                member_bundles.push(payload[p..p + blen].to_vec());
+                p += blen;
             }
             Ok(DecodedEnvelope::RoomInvite {
                 timestamp_ms,
@@ -321,7 +390,7 @@ pub fn decode_envelope(env: &[u8]) -> CryptoResult<DecodedEnvelope> {
                 name,
                 description,
                 owner_chain_seed,
-                member_pubkeys,
+                member_bundles,
             })
         }
         TYPE_FLAG_ROOM_SENDER_KEY => {
@@ -336,6 +405,39 @@ pub fn decode_envelope(env: &[u8]) -> CryptoResult<DecodedEnvelope> {
                 timestamp_ms,
                 room_id,
                 chain_seed,
+            })
+        }
+        TYPE_FLAG_ROOM_SENDER_KEY_ACK => {
+            if payload.len() < 16 {
+                return Err(CryptoError::Decode("room sender-key ack too short"));
+            }
+            let mut room_id = [0u8; 16];
+            room_id.copy_from_slice(&payload[..16]);
+            Ok(DecodedEnvelope::RoomSenderKeyAck {
+                timestamp_ms,
+                room_id,
+            })
+        }
+        TYPE_FLAG_MESSAGE_REACTION => {
+            if payload.len() < 32 + 1 + 2 {
+                return Err(CryptoError::Decode("reaction envelope truncated"));
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&payload[..32]);
+            let remove = payload[32] != 0;
+            let emoji_len =
+                u16::from_be_bytes(payload[33..35].try_into().unwrap()) as usize;
+            if payload.len() < 35 + emoji_len {
+                return Err(CryptoError::Decode("reaction emoji truncated"));
+            }
+            let emoji = std::str::from_utf8(&payload[35..35 + emoji_len])
+                .map_err(|_| CryptoError::Decode("reaction emoji not UTF-8"))?
+                .to_string();
+            Ok(DecodedEnvelope::MessageReaction {
+                timestamp_ms,
+                target_wire_hash: hash,
+                remove,
+                emoji,
             })
         }
         TYPE_FLAG_DETONATING_TEXT => {

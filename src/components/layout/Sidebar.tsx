@@ -142,7 +142,11 @@ function IdentityCard({ identity }: { identity: IdentitySummary }) {
       if (!link || typeof link !== "string") {
         throw new Error("invite link came back empty");
       }
-      await navigator.clipboard.writeText(link);
+      // Tauri's clipboard plugin works inside the macOS app webview;
+      // `navigator.clipboard.writeText` is blocked there with
+      // `NotAllowedError`.
+      const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+      await writeText(link);
       setState("copied");
       setTimeout(() => setState("idle"), 1500);
     } catch (e) {
@@ -152,31 +156,22 @@ function IdentityCard({ identity }: { identity: IdentitySummary }) {
     }
   };
 
-  const label =
-    state === "copying"
-      ? "copying…"
-      : state === "copied"
-      ? "✓ copied to clipboard"
-      : "copy invite link";
-
   return (
     <button
       onClick={copyInviteLink}
       title="Copies your whisper:// invite link. Paste it to anyone who wants to add you as a contact."
-      className="w-full text-left px-2 py-1.5 rounded-md bg-bg-inset hover:bg-bg-hover transition-colors group"
+      className="w-full text-left px-2 py-1.5 rounded-md bg-bg-inset hover:bg-bg-hover transition-colors"
     >
       <div className="flex items-center justify-between">
         <span className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
           You
         </span>
         <span
-          className={`text-[10px] font-mono uppercase tracking-wider transition-colors ${
-            state === "copied"
-              ? "text-status-ok"
-              : "text-text-tertiary group-hover:text-accent-400"
+          className={`text-[10px] font-mono uppercase tracking-wider transition-opacity ${
+            state === "copied" ? "text-status-ok opacity-100" : "opacity-0"
           }`}
         >
-          {label}
+          {state === "copied" ? "✓ copied" : ""}
         </span>
       </div>
       <div className="font-mono text-xs text-text-primary truncate">

@@ -33,10 +33,17 @@ use tokio::task::JoinHandle;
 ///
 /// The fields are public-by-Arc because `commands.rs` send paths and
 /// the security dashboard read them; nothing inside is mutable.
+///
+/// All long-lived background tasks register their `JoinHandle` here so
+/// `shutdown()` can `abort()` every one before we drop the vault. M-19:
+/// without this, tasks like the leaseset prewarm and the room-fanout
+/// drain — both holding an `Arc<I2PManager>` with a live SQLCipher
+/// connection — would keep running across `vault_lock`, contradicting
+/// the "lock clears keys from RAM" architectural property.
 pub struct I2PRuntime {
     pub manager: Arc<I2PManager>,
     pub connection: Arc<ConnectionManager>,
-    queue_worker: JoinHandle<()>,
+    background_tasks: Vec<JoinHandle<()>>,
 }
 
 impl I2PRuntime {
@@ -64,6 +71,12 @@ pub type FrameDispatcher = Arc<
         + Sync,
 >;
 
+/// Called by the queue worker once per message that flips from
+/// `queued` to `sent` after I2P delivery. Lets `commands.rs` emit a
+/// `message:status` event without the transport layer having to know
+/// about Tauri's `AppHandle`.
+pub type DeliveredCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 impl I2PRuntime {
     /// Construct from already-built parts. Used by `lifecycle::start`
     /// after it has spawned i2pd, built the ConnectionManager, started
@@ -73,30 +86,40 @@ impl I2PRuntime {
     pub fn from_parts(
         manager: Arc<I2PManager>,
         connection: Arc<ConnectionManager>,
-        queue_worker: JoinHandle<()>,
+        background_tasks: Vec<JoinHandle<()>>,
     ) -> Self {
         Self {
             manager,
             connection,
-            queue_worker,
+            background_tasks,
         }
     }
 
     /// Graceful teardown. Always run before dropping the I2PManager.
+    ///
+    /// Order matters:
+    /// 1. Abort every background task we own. Each task holds an
+    ///    `Arc<I2PManager>` (and through it a live SQLCipher
+    ///    `Database` connection); aborting them releases those Arcs
+    ///    so the `try_unwrap` below has a chance to succeed and we
+    ///    can take ownership of the manager for a clean shutdown.
+    /// 2. Stop the inbound accept loop and tear down cached outbound
+    ///    streams.
+    /// 3. SIGTERM i2pd (or, on Drop, SIGKILL via kill_on_drop).
     pub async fn shutdown(self) {
-        // 1. Stop the queue worker first so we don't try to send while
-        //    teardown is in progress.
-        self.queue_worker.abort();
-        let _ = self.queue_worker.await;
-        // 2. Stop the inbound accept loop + close cached outbound
-        //    streams. ConnectionManager::shutdown_inbound is `&self` so
-        //    we can call it through the Arc; the cached connections are
-        //    dropped when the last Arc drops.
+        for handle in &self.background_tasks {
+            handle.abort();
+        }
+        // Await each task's terminal future so its captured Arcs are
+        // dropped before we move on. abort() returns immediately; the
+        // task's frame is freed when its future is polled to completion
+        // (which `.await` on the JoinHandle does).
+        for handle in self.background_tasks {
+            let _ = handle.await;
+        }
+
         self.connection.shutdown_inbound().await;
-        // 3. Stop i2pd. We can only call `shutdown` on an owned manager
-        //    — if other Arc clones are alive we settle for kill_on_drop
-        //    semantics. In normal flow nothing else holds the manager
-        //    Arc by the time we get here.
+
         if let Ok(mgr) = Arc::try_unwrap(self.manager) {
             let _ = mgr.shutdown().await;
         } else {

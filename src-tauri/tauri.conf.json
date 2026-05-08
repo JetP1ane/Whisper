@@ -13,7 +13,7 @@
     "macOSPrivateApi": true,
     "withGlobalTauri": false,
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: https://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost wss: ws:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: https://asset.localhost; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'none'"
     },
     "windows": [
       {
@@ -53,7 +53,7 @@
     ],
     "category": "SocialNetworking",
     "shortDescription": "Private post-quantum messenger",
-    "longDescription": "Noctis Whisper is a privacy-focused desktop messenger with hybrid post-quantum end-to-end encryption, Secure Enclave key protection, and a zero-knowledge relay architecture.",
+    "longDescription": "Noctis Whisper is a privacy-focused desktop messenger with hybrid post-quantum end-to-end encryption, Secure Enclave key protection, and serverless I2P peer-to-peer transport.",
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "12.0",

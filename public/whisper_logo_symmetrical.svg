@@ -1,0 +1,18 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Whisper logo symmetrical</title>
+  <desc id="desc">A centered orange vertical bar with mirrored silver descending bars: lower-left bars and upper-right bars arranged symmetrically.</desc>
+  <rect width="1024" height="1024" fill="#ffffff"/>
+
+  <!-- Center orange signal line -->
+  <rect x="500" y="292" width="24" height="440" rx="12" fill="#F28A1A"/>
+
+  <!-- Left lower silver bars, mirrored from right upper bars -->
+  <rect x="285" y="523" width="22" height="86" rx="11" fill="#9B9B9B"/>
+  <rect x="358" y="523" width="22" height="126" rx="11" fill="#9B9B9B"/>
+  <rect x="431" y="523" width="22" height="166" rx="11" fill="#9B9B9B"/>
+
+  <!-- Right upper silver bars -->
+  <rect x="571" y="335" width="22" height="166" rx="11" fill="#9B9B9B"/>
+  <rect x="644" y="375" width="22" height="126" rx="11" fill="#9B9B9B"/>
+  <rect x="717" y="415" width="22" height="86" rx="11" fill="#9B9B9B"/>
+</svg>

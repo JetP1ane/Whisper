@@ -57,10 +57,9 @@ function PassphraseStep({
       setError("Passphrases don't match.");
       return;
     }
-    if (strength < 2) {
-      setError("Choose a stronger passphrase.");
-      return;
-    }
+    // Strength is shown but not enforced — the user picks their own
+    // threat model. The StrengthBar above gives visible feedback so
+    // the choice is informed.
     setBusy(true);
     setError(null);
     try {
@@ -111,7 +110,7 @@ function PassphraseStep({
         {error && <div className="mt-3 text-xs text-status-err">{error}</div>}
 
         <button
-          disabled={!matches || strength < 2 || busy}
+          disabled={!matches || busy}
           onClick={submit}
           className="btn-primary w-full mt-5 disabled:opacity-40"
         >
@@ -179,7 +178,10 @@ function ShowRecoveryPhrase({
         <div className="mt-3 flex items-center gap-2">
           <button
             onClick={async () => {
-              await navigator.clipboard.writeText(phrase);
+              const { writeText } = await import(
+                "@tauri-apps/plugin-clipboard-manager"
+              );
+              await writeText(phrase);
               setCopied(true);
               setTimeout(() => setCopied(false), 1500);
             }}
@@ -244,14 +246,13 @@ function RecoverFromSeed({
       setError("Passphrases don't match.");
       return;
     }
-    if (pass.length < 8) {
-      setError("Passphrase too short.");
-      return;
-    }
     setBusy(true);
     setError(null);
     try {
-      await vaultRecoverFromSeed(pass, phrase.trim());
+      // No existing vault yet (this is the fresh-install flow), so the
+      // M-14 destructive-wipe gate is a no-op — pass `true` so the call
+      // succeeds either way.
+      await vaultRecoverFromSeed(pass, phrase.trim(), true);
       onRecovered();
     } catch (e) {
       setError(String(e));

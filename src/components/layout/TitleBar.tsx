@@ -33,7 +33,7 @@ export function TitleBar({ onOpenSettings, onLock }: TitleBarProps = {}) {
         data-tauri-drag-region
         className="flex items-center gap-2 text-[11px] text-text-tertiary"
       >
-        <NoctisOwl size={14} className="text-text-secondary" />
+        <NoctisOwl size={32} className="text-text-secondary" />
         <span data-tauri-drag-region className="font-mono tracking-wider uppercase">
           whisper
         </span>
@@ -99,13 +99,19 @@ function SecurityShield({
     return () => document.removeEventListener("mousedown", onDocClick);
   }, [open]);
 
-  const protectedByEnclave =
+  // "Hardware-bound" means: seeds live in this Mac's Keychain with
+  // kSecAttrAccessibleWhenUnlockedThisDeviceOnly + Synchronizable=false,
+  // so the database can't be opened on another machine. The two
+  // tier strings below cover that case (the `_biometric` variant is
+  // reserved for when sealed-conversation operations are gated by
+  // Touch ID — currently unused).
+  const hardwareBound =
     tierRaw === "secure_enclave" || tierRaw === "secure_enclave_biometric";
   const biometric = tierRaw === "secure_enclave_biometric";
-  const healthy = unlocked && protectedByEnclave;
+  const healthy = unlocked && hardwareBound;
   const shieldColor = healthy
     ? "text-status-ok"
-    : protectedByEnclave
+    : hardwareBound
     ? "text-status-warn"
     : "text-text-tertiary";
 
@@ -115,15 +121,15 @@ function SecurityShield({
         onClick={() => setOpen((v) => !v)}
         className={`px-2 py-1 rounded-md hover:bg-bg-hover transition-colors ${shieldColor}`}
         title={
-          protectedByEnclave
+          hardwareBound
             ? `Keys protected by ${tier}. Click for details.`
             : "Keys are stored in software. Click for details."
         }
       >
-        <ShieldIcon filled={protectedByEnclave} />
+        <ShieldIcon filled={hardwareBound} />
       </button>
       {open && (
-        <div className="absolute right-0 top-full mt-1 w-[300px] rounded-lg border border-border-default bg-bg-panel shadow-xl p-3 z-50 animate-fade-in">
+        <div className="absolute right-0 top-full mt-1 w-[320px] rounded-lg border border-border-default bg-bg-panel shadow-xl p-3 z-50 animate-fade-in">
           <div className="flex items-center gap-2 mb-2">
             <span
               className={`w-1.5 h-1.5 rounded-full ${
@@ -131,10 +137,10 @@ function SecurityShield({
               }`}
             />
             <span className="text-xs text-text-primary font-medium">
-              {protectedByEnclave
+              {hardwareBound
                 ? biometric
-                  ? "Hardware + biometric"
-                  : "Hardware-backed"
+                  ? "Hardware-bound + biometric"
+                  : "Hardware-bound"
                 : "Software-only"}
             </span>
             <span className="ml-auto text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
@@ -142,22 +148,23 @@ function SecurityShield({
             </span>
           </div>
           <p className="text-[11px] text-text-secondary leading-relaxed">
-            {protectedByEnclave
-              ? `Your secret keys are anchored in this Mac's Secure Enclave — a separate chip that never releases key material in plaintext, even to this app.${
+            {hardwareBound
+              ? `Random 32-byte seeds are stored in this Mac's Keychain with kSecAttrAccessibleWhenUnlockedThisDeviceOnly + Synchronizable=false. The Keychain blob never leaves this device — copying the database file to another machine cannot decrypt your vault. While the vault is unlocked, derived seeds live in this app's memory; locking the vault clears them.${
                   biometric
-                    ? " Touch ID is required to release sensitive operations."
+                    ? " Sealed-conversation operations require an additional Touch ID prompt."
                     : ""
                 }`
-              : "This device has no Secure Enclave. Your keys are stored in the macOS login Keychain, encrypted at rest with your vault passphrase."}
+              : "This device has no macOS Keychain available. Your seeds are stored in a per-profile config file, encrypted at rest with your vault passphrase only."}
           </p>
           <div className="mt-3 text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
-            What this protects
+            Encrypted under the Keychain-bound seed
           </div>
           <ul className="mt-1 space-y-0.5 text-[11px] text-text-secondary">
-            <li>• Your long-term identity keys (Ed25519 + X25519 + ML-KEM)</li>
-            <li>• Vault encryption key (DEK) sealing the SQLCipher database</li>
-            <li>• I2P destination signing key + leaseset auth keys</li>
-            <li>• Per-conversation TEE keys protecting message bodies at rest</li>
+            <li>• SQLCipher database key (HKDF of DEK + Keychain seed)</li>
+            <li>• Long-term identity keys (Ed25519 + X25519 + ML-KEM)</li>
+            <li>• Vault DEK (Argon2id-sealed Keychain blob)</li>
+            <li>• I2P destination signing key (persisted in the encrypted DB)</li>
+            <li>• Per-conversation TEE keys (HMAC under TEE seed)</li>
             <li>• Room sender-key chain seeds</li>
           </ul>
         </div>
@@ -194,9 +201,9 @@ function ShieldIcon({ filled }: { filled: boolean }) {
 function formatTier(t: string): string {
   switch (t) {
     case "secure_enclave_biometric":
-      return "SE+TouchID";
+      return "HW+Bio";
     case "secure_enclave":
-      return "SE";
+      return "HW";
     case "software_only":
       return "Software";
     default:

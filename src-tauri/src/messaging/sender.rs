@@ -14,31 +14,21 @@ use crate::db::messages::Message;
 use crate::db::Database;
 use crate::identity::LoadedIdentity;
 use crate::transport::mailbox;
-use crate::transport::relay::RelayClient;
 use anyhow::Result;
 use rand::rngs::OsRng;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 
-const DEPOSIT_TTL_SECS: u64 = 60 * 60 * 24; // 24 h
-
-pub struct SendOutcome {
-    pub message: Message,
-    pub mailbox_hex: String,
-}
-
 /// What the caller (`commands::message_send`) needs to actually deliver the
 /// encrypted blob — either via the home relay (fast path) or to a different
-/// relay over a transient WebSocket connection.
+/// What `commands::message_send*` needs to dispatch the encrypted blob
+/// over I2P. `target_relay_url` was a relay-era field and is gone.
 pub struct PreparedSend {
     pub message: Message,
     pub mailbox_hex: String,
     pub blob: Vec<u8>,
     pub msg_id: String,
-    /// Where to deposit. `None` ⇒ use the persistent home connection;
-    /// `Some(url)` ⇒ caller opens a transient WS to that URL.
-    pub target_relay_url: Option<String>,
 }
 
 /// Synchronous core: encrypt + persist + decide where the deposit should go.
@@ -51,9 +41,9 @@ pub fn prepare_send_text(
     contact_bundle: &PublicKeyBundle,
     conversation_id: &str,
     text: &str,
-    home_relay_url: Option<&str>,
+    _home_relay_url: Option<&str>,
 ) -> Result<PreparedSend> {
-    prepare_send_text_inner(db, me, contact, contact_bundle, conversation_id, text, home_relay_url, None)
+    prepare_send_text_inner(db, me, contact, contact_bundle, conversation_id, text, None)
 }
 
 /// Self-detonating text variant: the TTL is sealed inside the AEAD, so
@@ -68,7 +58,7 @@ pub fn prepare_send_detonating_text(
     conversation_id: &str,
     text: &str,
     detonate_secs: u32,
-    home_relay_url: Option<&str>,
+    _home_relay_url: Option<&str>,
 ) -> Result<PreparedSend> {
     prepare_send_text_inner(
         db,
@@ -77,7 +67,6 @@ pub fn prepare_send_detonating_text(
         contact_bundle,
         conversation_id,
         text,
-        home_relay_url,
         Some(detonate_secs),
     )
 }
@@ -89,7 +78,6 @@ fn prepare_send_text_inner(
     contact_bundle: &PublicKeyBundle,
     conversation_id: &str,
     text: &str,
-    home_relay_url: Option<&str>,
     detonate_secs: Option<u32>,
 ) -> Result<PreparedSend> {
     let now_ms = now_unix_ms();
@@ -188,27 +176,16 @@ fn prepare_send_text_inner(
     )?;
     db.insert_message(&message, Some(&tee), None, Some(&wire_hash))?;
 
-    // 9. Decide deposit target. If the contact's home relay matches our own,
-    //    use the persistent home client; otherwise the caller will open a
-    //    transient connection to the contact's relay.
-    let target = match (contact.relay_url.as_deref(), home_relay_url) {
-        (Some(c), Some(h)) if !c.is_empty() && c != h => Some(c.to_string()),
-        (Some(c), None) if !c.is_empty() => Some(c.to_string()),
-        _ => None,
-    };
-
     Ok(PreparedSend {
         message,
         mailbox_hex: recipient_mb_hex,
         blob,
         msg_id,
-        target_relay_url: target,
     })
 }
 
 /// Synchronous core for attachment sends. Mirrors `prepare_send_text`'s
-/// shape so the caller can route the deposit either through the home WS
-/// (fast path) or via a transient connection to the contact's relay.
+/// shape so the caller dispatches the resulting blob over I2P.
 pub fn prepare_send_attachment(
     db: &Database,
     me: &LoadedIdentity,
@@ -218,7 +195,7 @@ pub fn prepare_send_attachment(
     filename: &str,
     mime_type: &str,
     bytes: &[u8],
-    home_relay_url: Option<&str>,
+    _home_relay_url: Option<&str>,
 ) -> Result<PreparedSend> {
     let now_ms = now_unix_ms();
 
@@ -289,50 +266,11 @@ pub fn prepare_send_attachment(
     };
     db.insert_message(&message, None, None, Some(&wire_hash))?;
 
-    let target = match (contact.relay_url.as_deref(), home_relay_url) {
-        (Some(c), Some(h)) if !c.is_empty() && c != h => Some(c.to_string()),
-        (Some(c), None) if !c.is_empty() => Some(c.to_string()),
-        _ => None,
-    };
-
     Ok(PreparedSend {
         message,
         mailbox_hex: recipient_mb_hex,
         blob,
         msg_id,
-        target_relay_url: target,
-    })
-}
-
-/// Backward-compatible wrapper: encrypt + persist + deposit on the home
-/// relay. Used by tests and code paths that don't need cross-relay routing.
-pub fn send_text(
-    db: &Database,
-    relay: &RelayClient,
-    me: &LoadedIdentity,
-    contact: &Contact,
-    contact_bundle: &PublicKeyBundle,
-    conversation_id: &str,
-    text: &str,
-) -> Result<SendOutcome> {
-    let prepared = prepare_send_text(
-        db,
-        me,
-        contact,
-        contact_bundle,
-        conversation_id,
-        text,
-        relay.current_url().as_deref(),
-    )?;
-    let _ = relay.deposit(
-        prepared.mailbox_hex.clone(),
-        &prepared.blob,
-        DEPOSIT_TTL_SECS,
-        prepared.msg_id.clone(),
-    );
-    Ok(SendOutcome {
-        message: prepared.message,
-        mailbox_hex: prepared.mailbox_hex,
     })
 }
 
@@ -387,10 +325,23 @@ fn bootstrap_initiator(
     Ok((out.master_secret, init_bytes, state))
 }
 
+/// Convenience export of the local `bootstrap_initiator` for callers
+/// in `messaging::inbound` that need to start a fresh ratchet without
+/// going through the full `prepare_send_text` path (e.g. the room
+/// sender-key fan-out, where we want the init bytes + state but no
+/// message persistence). Returns the same triple as the internal
+/// helper minus the unused `master_secret`.
+pub fn bootstrap_initiator_for(
+    me: &LoadedIdentity,
+    bundle: &PublicKeyBundle,
+) -> Result<(Vec<u8>, RatchetState)> {
+    let (_master, init, state) = bootstrap_initiator(me, bundle)?;
+    Ok((init, state))
+}
+
 /// Public wrapper around `bootstrap_initiator` returning just the
-/// session-init bytes + initial ratchet state. Used by room auto-bootstrap
-/// (`messaging::inbound::bootstrap_unknown_room_peers`) to share a sender-key
-/// seed with a co-participant we have never directly messaged.
+/// session-init bytes + initial ratchet state. Kept for any
+/// straggling callers; new code should use `bootstrap_initiator_for`.
 pub fn prepare_initiator_first_room_message(
     me: &LoadedIdentity,
     bundle: &PublicKeyBundle,

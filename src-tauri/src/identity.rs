@@ -193,7 +193,7 @@ pub fn load(db: &Database) -> anyhow::Result<Option<LoadedIdentity>> {
 /// **Relay URL**: included in the signed payload (v2 bundle field). Other
 /// clients deposit messages destined for this owner to this URL, enabling
 /// cross-relay messaging. `relay_url` is read from the `settings` table
-/// (`home_relay_url` key) — empty string when not set yet.
+/// (legacy field; no longer populated since the desktop client went I2P-only).
 pub fn build_published_bundle(db: &Database, id: &LoadedIdentity) -> anyhow::Result<PublicKeyBundle> {
     let spk = db
         .current_signed_prekey()?
@@ -216,14 +216,6 @@ pub fn build_published_bundle(db: &Database, id: &LoadedIdentity) -> anyhow::Res
         kyber_pub: Vec::new(),
     };
 
-    let relay_url = db
-        .settings_get("home_relay_url")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    // I2P destination (v3 bundle field). Empty for users who haven't
-    // started the I2P transport yet — the v2 relay_url path keeps
-    // working until they do.
     let i2p_destination = crate::transport::i2p::destination::load(db)
         .ok()
         .flatten()
@@ -238,7 +230,7 @@ pub fn build_published_bundle(db: &Database, id: &LoadedIdentity) -> anyhow::Res
         otpk_pub,
         id.alias.clone(),
         id.display_name.clone(),
-        relay_url,
+        String::new(), // relay_url — wire-format compat only, always empty
         i2p_destination,
     );
     Ok(bundle)

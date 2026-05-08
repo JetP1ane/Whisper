@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { vaultUnlock, vaultRecoverFromSeed } from "../../hooks/useCrypto";
 import { NoctisOwl } from "../shared/NoctisLogo";
 
@@ -25,10 +25,29 @@ function UnlockPanel({
 }) {
   const [pass, setPass] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  // 0 = idle, 1 = "Unlocking…" (instant after click), 2 = "Deriving key…"
+  // (after 1.5s — most of the wait is Argon2id memory-hard derivation),
+  // 3 = "Almost there…" (after 4s — total reassurance for slower Macs).
+  // The wall-clock cost itself isn't changing; this is purely so the
+  // user sees motion + plain-language status during what would
+  // otherwise feel like a hung button.
+  const [stage, setStage] = useState<0 | 1 | 2 | 3>(0);
+  const busy = stage !== 0;
+
+  // Auto-advance the busy stage on a timer so the label changes during
+  // the Argon2id wait. Reset on idle.
+  useEffect(() => {
+    if (stage !== 1) return;
+    const t1 = window.setTimeout(() => setStage(2), 1500);
+    const t2 = window.setTimeout(() => setStage(3), 4000);
+    return () => {
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+    };
+  }, [stage]);
 
   const submit = async () => {
-    setBusy(true);
+    setStage(1);
     setError(null);
     try {
       await vaultUnlock(pass);
@@ -36,15 +55,17 @@ function UnlockPanel({
     } catch (e) {
       setError(String(e));
     } finally {
-      setBusy(false);
+      setStage(0);
     }
   };
+
+  const stageLabel = stage === 3 ? "Almost there…" : stage === 2 ? "Deriving key…" : "Unlocking…";
 
   return (
     <div className="flex-1 flex items-center justify-center bg-bg-base">
       <div className="w-[360px] panel border rounded-xl p-6 animate-slide-up">
         <div className="flex items-center gap-2 text-text-tertiary">
-          <NoctisOwl size={14} />
+          <NoctisOwl size={40} />
           <span className="text-[10px] font-mono uppercase tracking-wider">
             Vault
           </span>
@@ -58,7 +79,8 @@ function UnlockPanel({
           onChange={(e) => setPass(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && submit()}
           placeholder="Vault passphrase"
-          className="input"
+          disabled={busy}
+          className="input disabled:opacity-60"
         />
         {error && (
           <div className="mt-2 text-xs text-status-err">{error}</div>
@@ -67,25 +89,53 @@ function UnlockPanel({
         <button
           disabled={!pass || busy}
           onClick={submit}
-          className="btn-primary w-full mt-4 disabled:opacity-40"
+          className="btn-primary w-full mt-4 disabled:opacity-40 flex items-center justify-center gap-2"
         >
-          {busy ? "Unlocking…" : "Unlock"}
+          {busy ? (
+            <>
+              <Spinner />
+              <span>{stageLabel}</span>
+            </>
+          ) : (
+            "Unlock"
+          )}
         </button>
 
-        <div className="mt-4 text-center">
-          <button
-            onClick={onChooseRecover}
-            className="text-[11px] text-text-tertiary hover:text-text-secondary"
-          >
-            Forgot passphrase? Restore from recovery phrase
-          </button>
-        </div>
+        {busy && stage >= 2 && (
+          <p className="mt-2 text-[10px] text-text-tertiary text-center leading-relaxed animate-fade-in">
+            Memory-hard key derivation — by design. Makes brute-forcing
+            your passphrase impractical even with the keychain blob.
+          </p>
+        )}
 
-        <div className="mt-4 text-[11px] text-text-tertiary text-center">
-          Your data never leaves this device unencrypted.
-        </div>
+        {!busy && (
+          <div className="mt-4 text-center">
+            <button
+              onClick={onChooseRecover}
+              className="text-[11px] text-text-tertiary hover:text-text-secondary"
+            >
+              Forgot passphrase? Restore from recovery phrase
+            </button>
+          </div>
+        )}
+
+        {!busy && (
+          <div className="mt-4 text-[11px] text-text-tertiary text-center">
+            Your data never leaves this device unencrypted.
+          </div>
+        )}
       </div>
     </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <span
+      role="status"
+      aria-label="Loading"
+      className="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin"
+    />
   );
 }
 
@@ -115,10 +165,6 @@ function RecoverPanel({
       setError("Passphrases don't match.");
       return;
     }
-    if (pass.length < 8) {
-      setError("Passphrase too short.");
-      return;
-    }
     if (!confirmingWipe) {
       setConfirmingWipe(true);
       return;
@@ -126,7 +172,10 @@ function RecoverPanel({
     setBusy(true);
     setError(null);
     try {
-      await vaultRecoverFromSeed(pass, phrase.trim());
+      // M-14: this is the destructive-wipe flow (existing vault on disk
+      // is replaced). The user has already passed the "confirmingWipe"
+      // UI gate above; relay that confirmation to the backend.
+      await vaultRecoverFromSeed(pass, phrase.trim(), true);
       onRecovered();
     } catch (e) {
       setError(String(e));
@@ -140,14 +189,14 @@ function RecoverPanel({
     <div className="flex-1 flex items-center justify-center bg-bg-base">
       <div className="w-[480px] panel border rounded-xl p-6 animate-slide-up">
         <div className="flex items-center gap-2 text-text-tertiary">
-          <NoctisOwl size={14} />
+          <NoctisOwl size={40} />
           <span className="text-[10px] font-mono uppercase tracking-wider">
             Restore from recovery phrase
           </span>
         </div>
         <h1 className="text-lg text-text-primary mt-1">Restore your identity</h1>
         <p className="text-xs text-text-secondary mt-2 leading-relaxed">
-          Enter your 12-word recovery phrase. This will <span className="text-status-err">wipe the existing vault on this device</span> and rebuild your identity from the phrase. Local message history is lost; your Whisper ID and contacts on the relay come back.
+          Enter your 12-word recovery phrase. This will <span className="text-status-err">wipe the existing vault on this device</span> and rebuild your Whisper ID and identity keys from the phrase. Local message history and contacts won't come back — message history is local-only by design.
         </p>
 
         <div className="mt-5 space-y-3">

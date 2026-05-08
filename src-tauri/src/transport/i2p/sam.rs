@@ -112,6 +112,19 @@ pub fn parse_reply(line: &str) -> I2pResult<SamReply> {
     Ok(SamReply { verb, kv })
 }
 
+/// True iff every byte of `s` is in the I2P base64 alphabet
+/// (`A-Z`, `a-z`, `0-9`, `-`, `~`) or is `=` padding. SAM commands are
+/// newline-and-space-delimited; a destination or id string that carries
+/// any other character can either inject a follow-on SAM command or
+/// confuse the bridge's tokenizer. This is the choke-point used by
+/// `stream_connect` and friends to validate caller-supplied tokens.
+fn is_safe_sam_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'~' || b == b'='
+        })
+}
+
 fn split_word(s: &str) -> I2pResult<(&str, &str)> {
     let s = s.trim_start();
     if s.is_empty() {
@@ -210,9 +223,13 @@ pub async fn dest_generate_oneshot(bridge_addr: &str) -> I2pResult<(String, Stri
 
 /// Tunnel-quality knobs we attach to every `SESSION CREATE`. Two hops
 /// inbound + outbound is the I2P default and gives a reasonable
-/// latency/anonymity tradeoff. Encrypted leasesets (Mod #2 in the
-/// design proposal) prevent random I2P participants from discovering
-/// that our destination exists.
+/// latency/anonymity tradeoff. The inbound/outbound *quantity* of 8
+/// (up from i2pd's default of 5) trades a bit of CPU + bandwidth for
+/// resilience: when one router on a tunnel path is slow, having
+/// several spare tunnels already built means the next send can pick a
+/// fresh one instead of waiting for a build cycle. With 8 tunnels in
+/// each direction, the probability that *every* tunnel is unavailable
+/// at the moment of send drops sharply.
 pub fn default_session_options() -> Vec<(&'static str, &'static str)> {
     vec![
         // 7 = EdDSA_SHA512_Ed25519. SAM accepts numeric form universally;
@@ -220,8 +237,8 @@ pub fn default_session_options() -> Vec<(&'static str, &'static str)> {
         ("SIGNATURE_TYPE", "7"),
         ("inbound.length", "2"),
         ("outbound.length", "2"),
-        ("inbound.quantity", "3"),
-        ("outbound.quantity", "3"),
+        ("inbound.quantity", "8"),
+        ("outbound.quantity", "8"),
         // LS2 (type 3) with ECIES-X25519-AEAD on-wire encryption.
         //
         // Encrypted LS2 (type 5) with per-client DH auth was attempted
@@ -367,6 +384,25 @@ pub async fn stream_connect(
     session_id: &str,
     peer_dest: &str,
 ) -> I2pResult<TcpStream> {
+    // M-15: SAM is a newline-delimited line protocol; embedding a peer
+    // destination directly into the command line is unsafe if the
+    // destination string carries `\n`, `\r`, or whitespace. A signed
+    // bundle's `i2p_destination` field is UTF-8 so a malicious peer
+    // could otherwise inject a follow-on SAM command (e.g. swap the
+    // session, request the destination's private key). I2P's base64
+    // alphabet is `A-Za-z0-9-~` plus `=` padding; reject anything
+    // outside that. Same for the session id we generated locally —
+    // belt-and-braces in case it ever flows from less-trusted state.
+    if !is_safe_sam_token(peer_dest) {
+        return Err(I2pError::Sam(format!(
+            "peer destination contains characters outside the I2P base64 alphabet — refusing to send to SAM"
+        )));
+    }
+    if !is_safe_sam_token(session_id) {
+        return Err(I2pError::Sam(format!(
+            "session id contains unsafe characters — refusing to send to SAM"
+        )));
+    }
     let mut buf = connect(bridge_addr).await?;
     let _version = hello(&mut buf).await?;
     let cmd = format!(
@@ -411,6 +447,12 @@ pub async fn stream_accept(
     bridge_addr: &str,
     session_id: &str,
 ) -> I2pResult<(TcpStream, String)> {
+    if !is_safe_sam_token(session_id) {
+        return Err(I2pError::Sam(
+            "session id contains unsafe characters — refusing to send to SAM"
+                .into(),
+        ));
+    }
     let mut buf = connect(bridge_addr).await?;
     let _version = hello(&mut buf).await?;
     let cmd = format!("STREAM ACCEPT ID={session_id} SILENT=false");
@@ -515,6 +557,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn is_safe_sam_token_accepts_valid_destinations() {
+        assert!(is_safe_sam_token(
+            "AbCdEf0123456789-~==~--abcdefghijklmnopqrstuvwxyz"
+        ));
+        assert!(is_safe_sam_token("session-id-42"));
+    }
+
+    #[test]
+    fn is_safe_sam_token_rejects_injection_attempts() {
+        // M-15 regression: any whitespace, newline, control char, or
+        // non-base64 character must be rejected so a malicious peer
+        // destination cannot inject a follow-on SAM command.
+        assert!(!is_safe_sam_token(""));
+        assert!(!is_safe_sam_token("ok\nDESTROY"));
+        assert!(!is_safe_sam_token("ok\rwhatever"));
+        assert!(!is_safe_sam_token("has space"));
+        assert!(!is_safe_sam_token("has\ttab"));
+        assert!(!is_safe_sam_token("plus+is+not+I2P+base64"));
+        assert!(!is_safe_sam_token("slash/also/not"));
+        assert!(!is_safe_sam_token("nul\0byte"));
+    }
+
+    #[test]
     fn parse_hello_reply_ok() {
         let r = parse_reply("HELLO REPLY RESULT=OK VERSION=3.3").unwrap();
         assert_eq!(r.verb, "HELLO REPLY");
@@ -586,6 +651,9 @@ mod tests {
         assert_eq!(m.get("i2cp.leaseSetEncType"), Some(&"4"));
         assert!(m.get("i2cp.leaseSetAuthType").is_none());
         assert_eq!(m.get("SIGNATURE_TYPE"), Some(&"7"));
+        // 8/8 tunnel pool (resilience boost over i2pd's default of 5).
+        assert_eq!(m.get("inbound.quantity"), Some(&"8"));
+        assert_eq!(m.get("outbound.quantity"), Some(&"8"));
     }
 
     #[test]

@@ -179,6 +179,18 @@ impl ConnectionManager {
         }
     }
 
+    /// Open a stream to `peer_dest` and stash it in the cache without
+    /// sending any payload. Used by the leaseset pre-warm task: the
+    /// `STREAM CONNECT` triggers leaseset lookup + tunnel build inside
+    /// i2pd, and keeping the resulting stream in the cache means the
+    /// next real send skips the dial entirely. Idempotent — if a fresh
+    /// connection is already cached, this is a near-no-op.
+    pub async fn prewarm(&self, peer_dest: &str) -> I2pResult<()> {
+        let stream = self.acquire_outbound(peer_dest).await?;
+        self.cache_outbound(peer_dest, stream).await;
+        Ok(())
+    }
+
     /// Get a connection to `peer_dest` — from the cache if it's fresh,
     /// otherwise dial through SAM.
     async fn acquire_outbound(&self, peer_dest: &str) -> I2pResult<TcpStream> {
@@ -215,6 +227,13 @@ impl ConnectionManager {
     /// Number of currently-cached outbound connections — for diagnostics.
     pub async fn cached_outbound_count(&self) -> usize {
         self.outbound.lock().await.len()
+    }
+
+    /// True iff we currently hold a live outbound stream to `peer_dest`.
+    /// Used by the InfoPanel to render a "Tunnel warm" indicator without
+    /// having to expose the cache map itself.
+    pub async fn has_cached_outbound(&self, peer_dest: &str) -> bool {
+        self.outbound.lock().await.contains_key(peer_dest)
     }
 
     /// Start the inbound accept loop. Each accepted connection runs the

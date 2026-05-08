@@ -97,14 +97,21 @@ const SEED_TEE: &str = "tee";
 const SEED_SEALED: &str = "sealed";
 
 /// Detect the best available hardware tier.
+///
+/// **Honesty note:** the `SecureEnclaveBiometric` variant is reserved for
+/// when the *database* seed itself is gated by Touch ID. Today only the
+/// optional sealed-conversation seed uses biometric ACL; the always-on
+/// DB seed is bound to the user's login keychain with
+/// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` + `kSecAttrSynchronizable=false`.
+/// Reporting `SecureEnclaveBiometric` here just because Touch ID is
+/// physically present would overstate the actual protection — so we
+/// report `SecureEnclave` on macOS regardless of biometric capability.
 pub fn detect_tier() -> HardwareTier {
     #[cfg(target_os = "macos")]
     {
-        if has_biometric_capability() {
-            HardwareTier::SecureEnclaveBiometric
-        } else {
-            HardwareTier::SecureEnclave
-        }
+        // Currently we never report SecureEnclaveBiometric; see doc comment.
+        let _ = has_biometric_capability;
+        HardwareTier::SecureEnclave
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -176,9 +183,10 @@ fn get_or_create_seed(
     }
 
     // 3. First run for this seed: generate, persist, cache.
+    // M-1: OsRng (getrandom syscall) for hardware-bound seed material.
     let mut fresh = Zeroizing::new([0u8; 32]);
     use rand::RngCore;
-    rand::thread_rng().fill_bytes(&mut *fresh);
+    rand::rngs::OsRng.fill_bytes(&mut *fresh);
     write_seed(account, &*fresh, biometric)?;
     cache_seed(account, &*fresh);
     Ok(fresh)
@@ -243,10 +251,9 @@ enum KeychainErr {
 mod imp {
     use super::*;
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
-    use security_framework::item::{ItemClass, ItemSearchOptions, Reference, SearchResult};
-    use security_framework::os::macos::keychain::SecKeychain;
     use security_framework::passwords::{
-        delete_generic_password, get_generic_password, set_generic_password,
+        delete_generic_password, get_generic_password, set_generic_password_options,
+        AccessControlOptions, PasswordOptions,
     };
 
     pub fn read(account: &str) -> Result<Vec<u8>, KeychainErr> {
@@ -261,52 +268,46 @@ mod imp {
     pub fn write(account: &str, value: &[u8], biometric: bool) -> Result<(), KeychainErr> {
         let svc = super::seed_service();
         // Replace any existing entry so the access-control flags stick.
+        // (Some users may have items written by an older build that used
+        // the default `kSecAttrAccessibleWhenUnlocked` accessibility — which
+        // was eligible for iCloud Keychain sync. Wipe and re-add with the
+        // tightened protection class.)
         let _ = delete_generic_password(&svc, account);
 
-        if biometric {
-            // Biometric-gated: use SecItemAdd with a SecAccessControl object.
-            // `security-framework`'s safe `set_generic_password` does not
-            // accept an access-control reference, so we drop to the lower-
-            // level item API to attach the ACL.
-            add_biometric_password(account, value).map_err(KeychainErr::Other)
+        // Build a SecAccessControl that pins the seed to:
+        //   - this device only (no iCloud Keychain sync, no migration to a
+        //     restored device), and
+        //   - only available while the user's account is unlocked.
+        // For the biometric path, additionally require Touch ID OR device
+        // passcode each use (the OS will fall back to passcode if biometry
+        // fails). `BIOMETRY_CURRENT_SET` invalidates the protection if the
+        // enrolled fingerprint set changes — that's the desired Signal-style
+        // semantics for sealed conversations.
+        let flags = if biometric {
+            (AccessControlOptions::BIOMETRY_CURRENT_SET
+                | AccessControlOptions::OR
+                | AccessControlOptions::DEVICE_PASSCODE)
+                .bits()
         } else {
-            // Always-after-login: plain generic password is fine; macOS
-            // assigns `kSecAttrAccessibleWhenUnlocked` by default.
-            set_generic_password(&svc, account, value)
-                .map_err(|e| KeychainErr::Other(e.to_string()))
-        }
-    }
-
-    #[allow(dead_code)]
-    fn add_biometric_password(account: &str, value: &[u8]) -> Result<(), String> {
-        // Build a SecAccessControl requiring `.biometryCurrentSet`.
-        let access = SecAccessControl::create_with_protection(
+            0
+        };
+        let acl = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
-            // `kSecAccessControlBiometryCurrentSet` flag bit. The
-            // security-framework crate doesn't expose a typed constant for
-            // every flag combination; the raw u32 value below is taken
-            // directly from <Security/SecAccessControl.h>.
-            //   kSecAccessControlBiometryCurrentSet = 1u << 3
-            1 << 3,
+            flags,
         )
-        .map_err(|e| format!("SecAccessControl create: {e}"))?;
-        let _ = access; // TODO(impl): pass `access` to SecItemAdd via the
-                        //              `kSecAttrAccessControl` attribute.
-        // The current `security-framework` safe API does not expose a way to
-        // attach SecAccessControl to a generic-password add. Until a future
-        // release plumbs this through (or we drop to raw FFI), we fall back
-        // to the same accessibility class as the non-biometric path. The
-        // sealed-key key derivation still happens in process and is
-        // protected by the SQLCipher vault.
-        let svc = super::seed_service();
-        set_generic_password(&svc, account, value)
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
+        .map_err(|e| KeychainErr::Other(format!("SecAccessControl create: {e}")))?;
 
-    // Suppress unused-import warnings until biometric ACL plumbing lands.
-    #[allow(dead_code)]
-    fn _unused(_: ItemClass, _: ItemSearchOptions, _: Reference, _: SearchResult, _: SecKeychain) {}
+        let mut options = PasswordOptions::new_generic_password(&svc, account);
+        options.set_access_control(acl);
+        // Belt-and-braces: explicitly opt out of iCloud Keychain. The
+        // `AccessibleWhenUnlockedThisDeviceOnly` protection already implies
+        // non-syncable, but setting `kSecAttrSynchronizable=false` makes
+        // the constraint visible at query time too.
+        options.set_access_synchronized(Some(false));
+
+        set_generic_password_options(value, options)
+            .map_err(|e| KeychainErr::Other(e.to_string()))
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

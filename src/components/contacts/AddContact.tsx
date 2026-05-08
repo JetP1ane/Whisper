@@ -62,7 +62,7 @@ export function AddContact({ onAdded, onCancel }: Props) {
         <input
           value={nickname}
           onChange={(e) => setNickname(e.target.value)}
-          placeholder="Mark"
+          placeholder="John Doe"
           className="input mt-1"
         />
         <p className="text-[10px] text-text-tertiary mt-1">

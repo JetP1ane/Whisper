@@ -119,13 +119,22 @@ pub fn list_queued(db: &Database) -> DbResult<Vec<QueuedSend>> {
 }
 
 /// Mark a row delivered + propagate status to the messages table.
+///
+/// The queue worker sets `messages.status` to `sent` (not `delivered`):
+/// the wire ACK from the peer's I2P endpoint confirms the bytes landed,
+/// not that the recipient successfully decrypted. The inbound
+/// delivery-receipt path bumps `sent → delivered` later. Also stamps
+/// `delivery_transport = 'i2p'` so the chat bubble can render the
+/// transport badge.
 pub fn mark_delivered(db: &Database, queue_id: &str, message_id: &str) -> DbResult<()> {
     db.conn.execute(
         "UPDATE i2p_send_queue SET status = 'delivered' WHERE id = ?1",
         params![queue_id],
     )?;
     db.conn.execute(
-        "UPDATE messages SET status = 'delivered' WHERE id = ?1",
+        "UPDATE messages
+         SET status = 'sent', delivery_transport = 'i2p'
+         WHERE id = ?1 AND status = 'queued'",
         params![message_id],
     )?;
     Ok(())
@@ -244,25 +253,28 @@ fn record_outcome(db: &Database, row: &QueuedSend, outcome: Attempt) {
 /// One pass of the queue worker, but the DB is held directly (not
 /// through an Option). Used by the I2PManager-backed worker that
 /// always has its DB present (no vault-lock state to track here).
+///
+/// Returns the message_ids of rows that flipped from `queued` to `sent`
+/// on this pass, so the caller can emit `message:status` events.
 pub async fn process_once_with_manager(
     db: &parking_lot::Mutex<Database>,
     conn: &ConnectionManager,
-) -> I2pResult<usize> {
+) -> I2pResult<Vec<String>> {
     let now = now_unix_ms();
     let due = {
         let guard = db.lock();
         take_due_rows(&guard, now)
     };
-    let mut delivered = 0;
+    let mut delivered_ids = Vec::new();
     for row in due {
         let outcome = try_send(conn, &row).await;
         if matches!(outcome, Attempt::Delivered) {
-            delivered += 1;
+            delivered_ids.push(row.message_id.clone());
         }
         let guard = db.lock();
         record_outcome(&guard, &row, outcome);
     }
-    Ok(delivered)
+    Ok(delivered_ids)
 }
 
 /// One pass of the queue worker — useful for tests that drive a single
@@ -420,7 +432,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(s, "delivered");
+        // The queue worker only confirms wire-ACK landed, so it bumps
+        // status to `sent` (not `delivered`). The inbound delivery
+        // receipt later promotes `sent` → `delivered`.
+        assert_eq!(s, "sent");
     }
 
     #[test]

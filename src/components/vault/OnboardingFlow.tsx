@@ -44,7 +44,10 @@ export function OnboardingFlow({ onContinue, showAlias = false }: Props) {
             <button
               onClick={async () => {
                 if (identity) {
-                  await navigator.clipboard.writeText(identity.alias);
+                  const { writeText } = await import(
+                    "@tauri-apps/plugin-clipboard-manager"
+                  );
+                  await writeText(identity.alias);
                   setCopied(true);
                   setTimeout(() => setCopied(false), 1500);
                 }

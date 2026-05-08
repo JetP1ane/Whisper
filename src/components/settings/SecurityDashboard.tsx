@@ -2,19 +2,9 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { vaultViewRecoveryPhrase } from "../../hooks/useCrypto";
 
-interface Snapshot {
-  frames_sent: number;
-  frames_received: number;
-  bytes_sent: number;
-  bytes_received: number;
-}
-
 interface SecurityStatus {
   vault_unlocked: boolean;
   hardware_tier: string;
-  relay_connected: boolean; // legacy field, ignored
-  relay_url: string | null; // legacy field, ignored
-  frame_counters: Snapshot;
 }
 
 interface I2pStatus {
@@ -86,8 +76,141 @@ export function SecurityDashboard() {
         )}
         <TransitOptInRow />
       </div>
+      <EgressAuditRow />
       <RecoveryPhraseRow />
     </section>
+  );
+}
+
+interface EgressConnection {
+  proto: string;
+  local_addr: string;
+  remote_addr: string;
+  state: string;
+  is_loopback: boolean;
+  is_expected: boolean;
+}
+
+interface EgressAudit {
+  connections: EgressConnection[];
+  expected_sam_addr: string | null;
+  unexpected_count: number;
+}
+
+function EgressAuditRow() {
+  const [audit, setAudit] = useState<EgressAudit | null>(null);
+  const [expanded, setExpanded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const a = await invoke<EgressAudit>("egress_audit");
+        if (!cancelled) setAudit(a);
+      } catch {
+        /* lsof unavailable or busy — try next tick */
+      }
+    };
+    tick();
+    const t = setInterval(tick, 5_000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, []);
+
+  if (!audit) return null;
+  const expected = audit.connections.filter((c) => c.is_expected).length;
+  const total = audit.connections.length;
+  const unexpected = audit.unexpected_count;
+  const allClean = unexpected === 0;
+
+  return (
+    <div>
+      <h3 className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
+        Network connections
+      </h3>
+      <div
+        className={
+          "p-3 rounded-md border " +
+          (allClean
+            ? // Healthy state: neutral panel chrome so the small green
+              // status dot is what carries the signal, not a green-tinted
+              // wash of the whole panel. Reserves the tinted-panel
+              // treatment for the unhealthy state where it actually
+              // means "look at this".
+              "bg-bg-raised border-border-subtle"
+            : "bg-status-err/10 border-status-err/40")
+        }
+      >
+        <div className="flex items-start gap-2">
+          <span
+            className={
+              "w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 " +
+              (allClean ? "bg-status-ok" : "bg-status-err animate-pulse")
+            }
+          />
+          <div className="flex-1 min-w-0">
+            <div className="text-xs text-text-primary">
+              {allClean ? (
+                <>
+                  {expected === 0 ? (
+                    <>No active connections from this app.</>
+                  ) : (
+                    <>
+                      {expected} connection{expected === 1 ? "" : "s"} —
+                      <span className="text-text-secondary"> all to local I2P bridge</span>
+                    </>
+                  )}
+                </>
+              ) : (
+                <span className="text-status-err">
+                  {unexpected} unexpected outbound connection
+                  {unexpected === 1 ? "" : "s"} detected
+                </span>
+              )}
+            </div>
+            <div className="text-[10px] text-text-tertiary mt-0.5">
+              Audit covers this Whisper process only. The I2P daemon's traffic
+              is anonymized and not listed here.
+            </div>
+            {total > 0 && (
+              <button
+                onClick={() => setExpanded((e) => !e)}
+                className="mt-2 text-[10px] font-mono uppercase tracking-wider text-text-tertiary hover:text-text-secondary"
+              >
+                {expanded ? "hide details" : "show details"}
+              </button>
+            )}
+            {expanded && (
+              <ul className="mt-2 space-y-1">
+                {audit.connections.map((c, i) => (
+                  <li
+                    key={i}
+                    className="text-[10px] font-mono text-text-secondary flex items-center gap-2"
+                  >
+                    <span
+                      className={
+                        "w-1 h-1 rounded-full shrink-0 " +
+                        (c.is_expected
+                          ? "bg-status-ok"
+                          : c.state === "LISTEN"
+                          ? "bg-text-tertiary"
+                          : "bg-status-err")
+                      }
+                    />
+                    <span>
+                      {c.proto} {c.local_addr} → {c.remote_addr}
+                      {c.state ? ` (${c.state})` : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -244,7 +367,10 @@ function RecoveryPhraseDisplay({ phrase, onHide }: { phrase: string; onHide: () 
       <div className="flex gap-2">
         <button
           onClick={async () => {
-            await navigator.clipboard.writeText(phrase);
+            const { writeText } = await import(
+              "@tauri-apps/plugin-clipboard-manager"
+            );
+            await writeText(phrase);
             setCopied(true);
             setTimeout(() => setCopied(false), 1500);
           }}
@@ -285,9 +411,9 @@ function Card({
 function prettyTier(t: string) {
   switch (t) {
     case "secure_enclave_biometric":
-      return "Secure Enclave + Touch ID";
+      return "Hardware-bound + Touch ID";
     case "secure_enclave":
-      return "Secure Enclave";
+      return "Hardware-bound";
     case "software_only":
       return "Software";
     default:

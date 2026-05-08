@@ -14,7 +14,6 @@ use crate::db::messages::{Conversation, Message};
 use crate::state::AppState;
 use crate::transport::envelopes::{is_session_request, unwrap_contact_request};
 use crate::transport::mailbox;
-use crate::transport::relay::{InboundEvent, RelayClient};
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -200,7 +199,6 @@ async fn handle_contact_request(
             ed25519_public: parsed.identity_key.to_vec(),
             x25519_public: parsed.x25519_key.to_vec(),
             mlkem_public: parsed.kyber_key.clone(),
-            relay_url: None,
             i2p_destination,
             verified: false,
             peer_has_verified_us: false,
@@ -211,6 +209,9 @@ async fn handle_contact_request(
             updated_at: now,
         };
         rt.db.upsert_contact(&contact)?;
+        // Cache the full signed bundle so subsequent message_send calls
+        // can bootstrap the ratchet without going to a relay registry.
+        rt.db.set_contact_signed_bundle(&contact.id, bundle_bytes)?;
 
         // Determine whether the conversation already exists and, if so,
         // whether it's already accepted (active). If we sent the original
@@ -284,7 +285,27 @@ async fn handle_subsequent(
     };
 
     let inbound_full_blob_hash = sha256_blob(sender_mb_hex.as_bytes(), wire);
-    let outcome = run_decrypt(state, &me, &contact, &conv_id, wire, None)?;
+
+    // Idempotency: have we already processed this exact blob? If so, the
+    // sender's queue is retransmitting because our previous ACK was lost.
+    // Re-emit the ACK and don't re-decrypt — the ratchet has already
+    // advanced past this msg_num and would error "out of order".
+    if inbound_blob_already_processed(state, &inbound_full_blob_hash) {
+        if let Err(e) = send_delivery_receipt(state, &contact, &conv_id, &inbound_full_blob_hash) {
+            tracing::warn!("inbound: re-ACK on retransmission failed: {e:#}");
+        }
+        return Ok(());
+    }
+
+    let outcome = run_decrypt(
+        state,
+        &me,
+        &contact,
+        &conv_id,
+        wire,
+        None,
+        Some(inbound_full_blob_hash),
+    )?;
     handle_outcome(app, state, &contact, &conv_id, &inbound_full_blob_hash, outcome);
     Ok(())
 }
@@ -319,7 +340,32 @@ async fn handle_first(
         full.extend_from_slice(&init_bytes);
         full.extend_from_slice(&inner);
         let blob_hash = sha256_bytes(&full);
-        let outcome = run_decrypt(state, &me, &contact, &conv_id, &inner, Some(init_bytes))?;
+
+        // Idempotency: a wrapped first-message we've already processed
+        // means the original ACK didn't make it back to the sender, who
+        // is retrying the byte-identical blob. Re-emit the ACK and
+        // return — without this short-circuit, bootstrap_responder
+        // would fail with "OTPK already consumed" and the sender's
+        // queue would keep retrying for up to 30 days. (See whitepaper:
+        // "retransmissions of Alice's first message converge.")
+        if inbound_blob_already_processed(state, &blob_hash) {
+            if let Err(e) = send_delivery_receipt(state, &contact, &conv_id, &blob_hash) {
+                tracing::warn!(
+                    "inbound: re-ACK on first-message retransmission failed: {e:#}"
+                );
+            }
+            return Ok(());
+        }
+
+        let outcome = run_decrypt(
+            state,
+            &me,
+            &contact,
+            &conv_id,
+            &inner,
+            Some(init_bytes),
+            Some(blob_hash),
+        )?;
         handle_outcome(app, state, &contact, &conv_id, &blob_hash, outcome);
         return Ok(());
     }
@@ -431,13 +477,23 @@ enum DecryptOutcome {
         name: String,
         description: String,
         owner_chain_seed: [u8; 32],
-        member_pubkeys: Vec<[u8; 32]>,
+        member_bundles: Vec<Vec<u8>>,
     },
     /// A peer shared their per-room sender-key seed via pairwise channel.
     /// Same lock-deferral rationale as `RoomInvite`.
     RoomSenderKey {
         room_id: [u8; 16],
         chain_seed: [u8; 32],
+    },
+    /// Peer ACK'd a `RoomSenderKey` we sent them. The send-side gate
+    /// for this `(room, peer)` is now open — drain any buffered fanout.
+    RoomSenderKeyAck { room_id: [u8; 16] },
+    /// Peer added or removed an emoji reaction on one of our (or a
+    /// shared) message, identified by the target's `wire_hash`.
+    MessageReaction {
+        target_wire_hash: [u8; 32],
+        remove: bool,
+        emoji: String,
     },
     /// Decrypted blob was an inner delivery-receipt — no row was persisted;
     /// the caller has already flipped the matching outbound row's status.
@@ -454,6 +510,7 @@ fn run_decrypt(
     conversation_id: &str,
     wire: &[u8],
     first_message_init: Option<Vec<u8>>,
+    blob_hash: Option<[u8; 32]>,
 ) -> Result<DecryptOutcome> {
     use crate::crypto::message_crypto::build_aad;
     use crate::messaging::ratchet_store;
@@ -547,14 +604,12 @@ fn run_decrypt(
             });
         }
         DecodedEnvelope::RelayUpdate { new_relay_url, .. } => {
-            // Peer told us their home relay changed. Update the contact row
-            // so future deposits go to the new URL.
-            tracing::info!(
-                "inbound: relay-update from `{}` → {}",
+            // Legacy envelope from a relay-era peer. Ignore.
+            tracing::debug!(
+                "inbound: ignoring legacy relay-update from `{}` ({} chars)",
                 contact.alias,
-                new_relay_url
+                new_relay_url.len()
             );
-            let _ = rt.db.set_contact_relay_url(&contact.id, &new_relay_url);
             return Ok(DecryptOutcome::Receipt {
                 wire_hash: [0u8; 32],
                 updated_message_id: None,
@@ -565,7 +620,7 @@ fn run_decrypt(
             name,
             description,
             owner_chain_seed,
-            member_pubkeys,
+            member_bundles,
             ..
         } => {
             // Defer the actual room-create side-effects to handle_outcome;
@@ -575,7 +630,7 @@ fn run_decrypt(
                 name,
                 description,
                 owner_chain_seed,
-                member_pubkeys,
+                member_bundles,
             });
         }
         DecodedEnvelope::RoomSenderKey {
@@ -586,6 +641,21 @@ fn run_decrypt(
             return Ok(DecryptOutcome::RoomSenderKey {
                 room_id,
                 chain_seed,
+            });
+        }
+        DecodedEnvelope::RoomSenderKeyAck { room_id, .. } => {
+            return Ok(DecryptOutcome::RoomSenderKeyAck { room_id });
+        }
+        DecodedEnvelope::MessageReaction {
+            target_wire_hash,
+            remove,
+            emoji,
+            ..
+        } => {
+            return Ok(DecryptOutcome::MessageReaction {
+                target_wire_hash,
+                remove,
+                emoji,
             });
         }
     };
@@ -635,7 +705,12 @@ fn run_decrypt(
         disappear_at,
         created_at: now_ms,
     };
-    rt.db.insert_message(&message, tee.as_deref(), None, None)?;
+    rt.db.insert_message(
+        &message,
+        tee.as_deref(),
+        None,
+        blob_hash.as_ref().map(|h| h.as_slice()),
+    )?;
 
     // Stash the decrypted attachment bytes encrypted-at-rest under the
     // profile dir so the UI can re-open the file later.
@@ -852,7 +927,7 @@ fn handle_outcome(
             name,
             description,
             owner_chain_seed,
-            member_pubkeys,
+            member_bundles,
         } => {
             // Run the side-effects here, OUTSIDE the run_decrypt vault lock,
             // so the inner re-lock inside handle_room_invite is safe.
@@ -863,7 +938,7 @@ fn handle_outcome(
                 &name,
                 &description,
                 &owner_chain_seed,
-                &member_pubkeys,
+                &member_bundles,
             );
             let _ = app.emit("rooms:changed", serde_json::json!({}));
         }
@@ -888,6 +963,81 @@ fn handle_outcome(
                 }
             }
         }
+        DecryptOutcome::RoomSenderKeyAck { room_id } => {
+            handle_room_sender_key_ack(state, contact, &room_id);
+        }
+        DecryptOutcome::MessageReaction {
+            target_wire_hash,
+            remove,
+            emoji,
+        } => {
+            handle_message_reaction(
+                app,
+                state,
+                contact,
+                &target_wire_hash,
+                remove,
+                &emoji,
+            );
+        }
+    }
+}
+
+/// Inbound emoji reaction. Look up the message by `wire_hash`, then
+/// add or remove the row in `message_reactions` keyed by the peer's
+/// alias. Idempotent — re-applying or re-removing the same emoji is
+/// a no-op via the table's unique constraint.
+fn handle_message_reaction(
+    app: &AppHandle,
+    state: &AppState,
+    from_contact: &Contact,
+    target_wire_hash: &[u8; 32],
+    remove: bool,
+    emoji: &str,
+) {
+    let conv_emit = {
+        let guard = state.vault.lock();
+        let Some(rt) = guard.as_ref() else { return };
+        let row: Option<(String, String)> = rt
+            .db
+            .conn
+            .query_row(
+                "SELECT id, conversation_id FROM messages WHERE wire_hash = ?1 LIMIT 1",
+                rusqlite::params![target_wire_hash.as_slice()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        let Some((message_id, conv_id)) = row else {
+            tracing::debug!(
+                "reaction: no local message matches wire_hash from `{}` — dropping",
+                from_contact.alias
+            );
+            return;
+        };
+        let now = now_unix_ms();
+        if remove {
+            let _ = rt.db.conn.execute(
+                "DELETE FROM message_reactions
+                 WHERE message_id = ?1 AND reactor_alias = ?2 AND emoji = ?3",
+                rusqlite::params![message_id, from_contact.alias, emoji],
+            );
+        } else {
+            let id = uuid::Uuid::new_v4().to_string();
+            let _ = rt.db.conn.execute(
+                "INSERT OR IGNORE INTO message_reactions
+                    (id, message_id, reactor_alias, emoji, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, message_id, from_contact.alias, emoji, now],
+            );
+        }
+        Some(conv_id)
+    };
+    if let Some(conv_id) = conv_emit {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "message:reaction",
+            serde_json::json!({ "conversation_id": conv_id }),
+        );
     }
 }
 
@@ -963,6 +1113,20 @@ fn send_delivery_receipt(
     Ok(())
 }
 
+/// Cheap idempotency probe: have we already inserted an inbound message
+/// with this exact wire-blob hash? Used by the dispatch layer to absorb
+/// peer retransmissions silently — re-ACK and return rather than re-run
+/// the responder bootstrap (which would error because the OTPK is gone).
+fn inbound_blob_already_processed(state: &AppState, blob_hash: &[u8; 32]) -> bool {
+    let guard = state.vault.lock();
+    let Some(rt) = guard.as_ref() else {
+        return false;
+    };
+    rt.db
+        .inbound_message_exists_by_wire_hash(blob_hash)
+        .unwrap_or(false)
+}
+
 fn sha256_blob(prefix: &[u8], wire: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -996,6 +1160,15 @@ fn now_unix_ms() -> i64 {
 ///
 /// Steps 1–4 happen synchronously under the vault lock. Step 5 is delegated
 /// to a fresh tokio task because it may need cross-relay deposits.
+/// Hard cap on members carried by a single RoomInvite. The wire format
+/// allows up to 65,535 entries, but a legitimate room is small (a few
+/// people to a few dozen). Without this cap, any current contact could
+/// flood our contact list with tens of thousands of fake peers and
+/// trigger an outbound RoomSenderKey fan-out to every one of them
+/// (NEW-2 in the second-pass pentest). 64 covers any realistic room
+/// while making the abuse surface bounded.
+const MAX_ROOM_INVITE_MEMBERS: usize = 64;
+
 fn handle_room_invite(
     state: &AppState,
     from_contact: &Contact,
@@ -1003,18 +1176,83 @@ fn handle_room_invite(
     name: &str,
     description: &str,
     owner_chain_seed: &[u8; 32],
-    member_pubkeys: &[[u8; 32]],
+    member_bundles: &[Vec<u8>],
 ) {
+    use crate::crypto::bundle as bundlemod;
     use crate::crypto::sender_key::SenderKey;
+    use crate::db::contacts::Contact;
     use crate::db::messages::Conversation;
     use rand::{rngs::OsRng, RngCore};
     use uuid::Uuid;
 
+    if member_bundles.len() > MAX_ROOM_INVITE_MEMBERS {
+        tracing::warn!(
+            "inbound: room invite from `{}` carries {} members (cap is {}) — rejecting as abusive",
+            from_contact.alias,
+            member_bundles.len(),
+            MAX_ROOM_INVITE_MEMBERS
+        );
+        return;
+    }
+
     let room_uuid = Uuid::from_bytes(*room_id).to_string();
     let now = now_unix_ms();
 
-    // We need our own pubkey + the contact's pubkey for the upcoming
-    // sender-key fan-out, so collect identity + member rows once.
+    // NEW-2c: if the room already exists locally, the inviter MUST be the
+    // recorded owner. Otherwise any current contact could resend an
+    // invite for a room they are merely a member of (or have left), and
+    // hijack the member-bundle injection path. For a brand-new room
+    // (no `room_members` row yet) we accept the invite — that's the
+    // legitimate first-time-receiving-this-room case.
+    {
+        let guard = state.vault.lock();
+        if let Some(rt) = guard.as_ref() {
+            let existing_owner: Option<String> = rt
+                .db
+                .conn
+                .query_row(
+                    "SELECT contact_id FROM room_members
+                     WHERE room_id = ?1 AND role = 'owner' LIMIT 1",
+                    rusqlite::params![&room_uuid],
+                    |r| r.get(0),
+                )
+                .ok();
+            if let Some(owner_id) = existing_owner {
+                if owner_id != from_contact.id {
+                    tracing::warn!(
+                        "inbound: room invite from `{}` for room {} that we already have under a different owner — rejecting",
+                        from_contact.alias,
+                        &room_uuid[..8]
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    // Pre-parse + verify each member bundle outside the vault lock.
+    // Skip any malformed entry — invite still proceeds with the rest.
+    let mut parsed_bundles: Vec<bundlemod::PublicKeyBundle> = Vec::new();
+    for raw in member_bundles {
+        match bundlemod::deserialize(raw)
+            .and_then(|b| bundlemod::verify_bundle(&b).map(|_| b))
+        {
+            Ok(b) => parsed_bundles.push(b),
+            Err(e) => {
+                tracing::warn!(
+                    "inbound: room invite contained an invalid member bundle: {e}"
+                );
+            }
+        }
+    }
+    if parsed_bundles.is_empty() {
+        tracing::warn!(
+            "inbound: room invite from `{}` had no valid member bundles — ignoring",
+            from_contact.alias
+        );
+        return;
+    }
+
     let my_chain_seed = {
         let mut seed = [0u8; 32];
         OsRng.fill_bytes(&mut seed);
@@ -1027,8 +1265,9 @@ fn handle_room_invite(
         let me_pub = rt.identity.keys.ed25519_verifying().to_bytes();
 
         // Skip if we're not actually one of the invited members.
-        if !member_pubkeys.iter().any(|p| *p == me_pub)
-            && !member_pubkeys.is_empty()
+        if !parsed_bundles
+            .iter()
+            .any(|b| b.identity_key.as_slice() == me_pub.as_slice())
         {
             tracing::warn!(
                 "inbound: room invite from `{}` excludes me — ignoring",
@@ -1064,23 +1303,21 @@ fn handle_room_invite(
             now,
         );
 
-        // 3. Build the broadcast list for our own sender-key share. Every
-        //    OTHER member needs our seed to decrypt our future messages —
-        //    *including* the owner who invited us. The owner row has
-        //    already been inserted in step 2, so we just don't re-upsert
-        //    them as pending. Members we don't yet have a contact for go
-        //    into `unknown_pubkeys` for an out-of-band auto-bootstrap.
-        let mut peers_to_notify: Vec<crate::db::contacts::Contact> = Vec::new();
-        let mut unknown_pubkeys: Vec<[u8; 32]> = Vec::new();
+        // 3. Build the broadcast list. Every other member needs our
+        //    sender-key seed; we either match by pubkey to an existing
+        //    contact row or persist a fresh contact from the bundle
+        //    that arrived inline with the invite.
+        let mut peers_to_notify: Vec<Contact> = Vec::new();
         let known_contacts = rt.db.list_contacts().unwrap_or_default();
-        for pk in member_pubkeys {
-            if *pk == me_pub {
+        for pb in &parsed_bundles {
+            if pb.identity_key.as_slice() == me_pub.as_slice() {
                 continue;
             }
-            let is_owner = from_contact.ed25519_public.as_slice() == pk.as_slice();
+            let is_owner = from_contact.ed25519_public.as_slice()
+                == pb.identity_key.as_slice();
             if let Some(c) = known_contacts
                 .iter()
-                .find(|c| c.ed25519_public.as_slice() == pk.as_slice())
+                .find(|c| c.ed25519_public.as_slice() == pb.identity_key.as_slice())
             {
                 if !is_owner {
                     let _ = crate::messaging::room_keys::upsert_member_pending(
@@ -1095,31 +1332,98 @@ fn handle_room_invite(
             } else if is_owner {
                 peers_to_notify.push(from_contact.clone());
             } else {
-                // Co-participant we've never talked to before (e.g. Alice
-                // invited us into a room with Charlie, and we have no prior
-                // pairwise session with Charlie). Defer the bootstrap to a
-                // background task that fetches Charlie's bundle, sends him a
-                // contact-request, and then shares our sender-key seed.
-                unknown_pubkeys.push(*pk);
+                // Brand-new co-participant: persist the bundle as a
+                // contact (and cache the bundle bytes so future sends
+                // can ratchet against them) instead of dropping into
+                // the old "unknown — give up" path.
+                let i2p_destination = if pb.i2p_destination.is_empty() {
+                    None
+                } else {
+                    Some(pb.i2p_destination.clone())
+                };
+                let new_contact = Contact {
+                    id: Uuid::new_v4().to_string(),
+                    alias: pb.alias.clone(),
+                    ed25519_public: pb.identity_key.to_vec(),
+                    x25519_public: pb.x25519_key.to_vec(),
+                    mlkem_public: pb.kyber_key.clone(),
+                    i2p_destination,
+                    verified: false,
+                    peer_has_verified_us: false,
+                    hide_until_verified: false,
+                    is_sealed: false,
+                    nickname: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                if rt.db.upsert_contact(&new_contact).is_ok() {
+                    let raw = bundlemod::serialize(pb);
+                    let _ = rt
+                        .db
+                        .set_contact_signed_bundle(&new_contact.id, &raw);
+                    // Create an empty direct-message conversation row
+                    // so the new contact appears in the sidebar's DM
+                    // list. Without this the contact exists in the DB
+                    // but is invisible to the user until they exchange
+                    // a real DM. The `is_pending = true` flag mirrors
+                    // the "incoming contact request" UX — the user
+                    // explicitly accepts before the chat opens.
+                    //
+                    // NEW-2a: this used to hard-code `is_pending: false`,
+                    // which contradicted the comment above and let any
+                    // room owner inject DMs straight into the main list.
+                    // Auto-bootstrapped contacts now correctly land in
+                    // the pending-requests gate.
+                    let _ = rt.db.upsert_conversation(&Conversation {
+                        id: new_contact.id.clone(),
+                        kind: "direct".into(),
+                        contact_id: Some(new_contact.id.clone()),
+                        contact_alias: None,
+                        contact_nickname: None,
+                        room_name: None,
+                        room_description: None,
+                        disappear_timer: None,
+                        is_sealed: false,
+                        is_pending: true,
+                        last_message_at: None,
+                        unread_count: 0,
+                        created_at: now,
+                    });
+                    let _ = crate::messaging::room_keys::upsert_member_pending(
+                        &rt.db,
+                        &room_uuid,
+                        &new_contact.id,
+                        "member",
+                        now,
+                    );
+                    tracing::info!(
+                        "room: persisted new contact `{}` from invite bundle",
+                        new_contact.alias
+                    );
+                    peers_to_notify.push(new_contact);
+                }
             }
         }
 
-        // 4. Our own sender-key for this room (separate from peer rows
-        //    because we don't FK against a contact row for ourselves).
+        // 4. Our own sender-key for this room.
         let me_sk = SenderKey::from_seed(my_chain_seed);
         let _ = crate::messaging::room_keys::save_self(&rt.db, &room_uuid, &me_sk);
 
-        Some((my_chain_seed, peers_to_notify, unknown_pubkeys))
+        Some((my_chain_seed, peers_to_notify))
     };
 
-    // 5. Fan out our sender key to every other member, and bootstrap any
-    //    co-participants we don't yet have a contact for.
-    if let Some((seed, peers, unknown)) = outcome {
+    // 5. Fan out our sender key to every other member.
+    if let Some((seed, peers)) = outcome {
         broadcast_sender_key(state, *room_id, seed, peers);
-        if !unknown.is_empty() {
-            bootstrap_unknown_room_peers(*room_id, seed, unknown);
-        }
     }
+
+    // 6. ACK the owner so their `peer_acked_my_key_at` for us flips.
+    //    The owner's seed travelled inline with the invite, so they
+    //    will never receive a RoomSenderKey envelope from us — this is
+    //    the only signal they get that the invite landed. Without it
+    //    the owner buffers every room message in `room_pending_fanout`
+    //    waiting for an ACK that never comes.
+    send_room_sender_key_ack(from_contact.clone(), *room_id);
 }
 
 /// Persist a peer's sender-key seed for an existing room. Creates or updates
@@ -1134,105 +1438,157 @@ fn handle_room_sender_key(
     let room_uuid = Uuid::from_bytes(*room_id).to_string();
     let now = now_unix_ms();
 
-    let guard = state.vault.lock();
-    let Some(rt) = guard.as_ref() else { return };
-    let _ = crate::messaging::room_keys::upsert_member_with_seed(
-        &rt.db,
-        &room_uuid,
-        &from_contact.id,
-        "member",
-        chain_seed,
-        now,
-    );
-    tracing::info!(
-        "inbound: stored sender-key for {} in room {}",
-        from_contact.alias,
-        &room_uuid[..8]
-    );
+    {
+        let guard = state.vault.lock();
+        let Some(rt) = guard.as_ref() else { return };
+        let _ = crate::messaging::room_keys::upsert_member_with_seed(
+            &rt.db,
+            &room_uuid,
+            &from_contact.id,
+            "member",
+            chain_seed,
+            now,
+        );
+        tracing::info!(
+            "inbound: stored sender-key for {} in room {}",
+            from_contact.alias,
+            &room_uuid[..8]
+        );
+    }
+    // Fire-and-forget ACK back to the peer so they know it's safe to
+    // start fanning room messages out to us. Without this their first
+    // room message can race ahead of our key-store and we'd silently
+    // drop the ciphertext.
+    send_room_sender_key_ack(from_contact.clone(), *room_id);
 }
 
-/// Send a `RoomSenderKey` envelope to every contact in `peers` over the
-/// existing pairwise Double Ratchet. Spawned as a fresh task to avoid
-/// holding the vault lock across awaits.
-fn broadcast_sender_key(
-    state: &AppState,
-    room_id_bytes: [u8; 16],
-    chain_seed: [u8; 32],
-    peers: Vec<Contact>,
-) {
+/// Send a `RoomSenderKeyAck` envelope to `peer` over the existing
+/// pairwise ratchet. The ACK piggybacks on the same Double Ratchet
+/// channel as a regular text message.
+fn send_room_sender_key_ack(peer: Contact, room_id: [u8; 16]) {
     use crate::crypto::message_crypto::{
-        build_aad, build_room_sender_key_envelope, pack_text_wire, pad_pkcs7, RatchetWire,
+        build_aad, build_room_sender_key_ack_envelope, pack_text_wire, pad_pkcs7, RatchetWire,
     };
     use crate::crypto::ratchet;
     use crate::crypto::PAD_BLOCK;
-    use std::time::Duration;
     let state_arc = match crate::commands::shared_state() {
         Some(a) => a,
         None => return,
     };
     let now_ms = now_unix_ms();
     tokio::spawn(async move {
-        for contact in peers {
-            let envelope =
-                build_room_sender_key_envelope(now_ms as u64, &room_id_bytes, &chain_seed);
-            let padded = pad_pkcs7(&envelope, PAD_BLOCK);
-            let prepared = {
-                let guard = state_arc.vault.lock();
-                let Some(rt) = guard.as_ref() else { break };
-                let mut state =
-                    match crate::messaging::ratchet_store::load(&rt.db, &contact.id)
-                        .ok()
-                        .flatten()
-                    {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                let enc = match ratchet::encrypt_message(&mut state, &padded, build_aad) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-                let wire = match pack_text_wire(&RatchetWire {
-                    ratchet_key: &enc.ratchet_key,
-                    prev_chain_len: enc.prev_chain_len,
-                    msg_num: enc.msg_num,
-                    nonce: &enc.nonce,
-                    ciphertext: &enc.ciphertext,
-                    sentinel_digest: None,
-                }) {
-                    Ok(w) => w,
-                    Err(_) => continue,
-                };
-                let _ = crate::messaging::ratchet_store::save(&rt.db, &contact.id, &state);
+        let envelope = build_room_sender_key_ack_envelope(now_ms as u64, &room_id);
+        let padded = pad_pkcs7(&envelope, PAD_BLOCK);
+        let prepared = {
+            let guard = state_arc.vault.lock();
+            let Some(rt) = guard.as_ref() else { return };
+            let mut rs = match crate::messaging::ratchet_store::load(&rt.db, &peer.id)
+                .ok()
+                .flatten()
+            {
+                Some(s) => s,
+                None => {
+                    tracing::debug!(
+                        "ack: no ratchet for {} — peer's RoomSenderKey arrived via fresh bootstrap; skipping ACK",
+                        peer.alias
+                    );
+                    return;
+                }
+            };
+            let enc = match ratchet::encrypt_message(&mut rs, &padded, build_aad) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let wire = match pack_text_wire(&RatchetWire {
+                ratchet_key: &enc.ratchet_key,
+                prev_chain_len: enc.prev_chain_len,
+                msg_num: enc.msg_num,
+                nonce: &enc.nonce,
+                ciphertext: &enc.ciphertext,
+                sentinel_digest: None,
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            let _ = crate::messaging::ratchet_store::save(&rt.db, &peer.id, &rs);
 
-                let me_pub = rt.identity.keys.ed25519_verifying().to_bytes();
-                let sender_mb_hex = crate::transport::mailbox::hex(
-                    &crate::transport::mailbox::current_mailbox(&me_pub),
-                );
-                let recipient_mb_hex = crate::transport::mailbox::hex(
-                    &crate::transport::mailbox::current_mailbox(&contact.ed25519_public),
-                );
+            let me_pub = rt.identity.keys.ed25519_verifying().to_bytes();
+            let sender_mb_hex = mailbox::hex(&mailbox::current_mailbox(&me_pub));
+            let mut blob = Vec::with_capacity(32 + wire.len());
+            blob.extend_from_slice(sender_mb_hex.as_bytes());
+            blob.extend_from_slice(&wire);
+            Some(blob)
+        };
+        let Some(blob) = prepared else { return };
+        let i2p_runtime = {
+            let slot = state_arc.i2p.lock().await;
+            slot.as_ref().cloned()
+        };
+        let Some(rt) = i2p_runtime else { return };
+        let Some(dest) = peer.i2p_destination.as_deref() else { return };
+        if let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) {
+            let _ = rt
+                .connection
+                .send_blob(
+                    dest,
+                    crate::transport::i2p::framing::FrameType::Message,
+                    inner,
+                )
+                .await;
+        }
+    });
+}
 
-                let mut blob = Vec::with_capacity(32 + wire.len());
-                blob.extend_from_slice(sender_mb_hex.as_bytes());
-                blob.extend_from_slice(&wire);
-                Some((
-                    blob,
-                    recipient_mb_hex,
-                    contact.relay_url.clone(),
-                ))
-            };
-
-            let Some((blob, _recipient_mb_hex, _target)) = prepared else {
-                continue;
-            };
-            let i2p_runtime = {
-                let slot = state_arc.i2p.lock().await;
-                slot.as_ref().cloned()
-            };
-            let Some(rt) = i2p_runtime else { continue };
-            let Some(dest) = contact.i2p_destination.as_deref() else {
-                continue;
-            };
+/// Handle the ACK arriving back from `from_contact`: mark the
+/// `(room, contact)` pair as ready and drain any room messages we
+/// buffered for them while waiting.
+fn handle_room_sender_key_ack(
+    state: &AppState,
+    from_contact: &Contact,
+    room_id: &[u8; 16],
+) {
+    use uuid::Uuid;
+    let room_uuid = Uuid::from_bytes(*room_id).to_string();
+    let now = now_unix_ms();
+    let drained: Vec<(String, Vec<u8>)> = {
+        let guard = state.vault.lock();
+        let Some(rt) = guard.as_ref() else { return };
+        let _ = crate::messaging::room_keys::mark_peer_acked_my_key(
+            &rt.db,
+            &room_uuid,
+            &from_contact.id,
+            now,
+        );
+        rt.db
+            .drain_room_pending_fanout(&room_uuid, &from_contact.id)
+            .unwrap_or_default()
+    };
+    if drained.is_empty() {
+        tracing::debug!(
+            "inbound: room ACK from {} (room {}) — nothing buffered",
+            from_contact.alias,
+            &room_uuid[..8]
+        );
+        return;
+    }
+    tracing::info!(
+        "inbound: room ACK from {} — draining {} buffered messages",
+        from_contact.alias,
+        drained.len()
+    );
+    let peer = from_contact.clone();
+    tokio::spawn(async move {
+        let state_arc = match crate::commands::shared_state() {
+            Some(a) => a,
+            None => return,
+        };
+        let i2p_runtime = {
+            let slot = state_arc.i2p.lock().await;
+            slot.as_ref().cloned()
+        };
+        let Some(rt) = i2p_runtime else { return };
+        let Some(dest) = peer.i2p_destination.as_deref() else { return };
+        for (_msg_id, blob) in drained {
             if let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) {
                 let _ = rt
                     .connection
@@ -1245,6 +1601,251 @@ fn broadcast_sender_key(
             }
         }
     });
+}
+
+/// Send a `RoomSenderKey` envelope to every contact in `peers` over
+/// the pairwise Double Ratchet, retrying per-peer with backoff until
+/// each peer ACKs (or the budget is exhausted).
+///
+/// The retry is essential: when both sides receive a room invite at
+/// the same time and both spawn their own broadcast, one side's first
+/// message can land before the other side has finished
+/// `handle_room_invite` and persisted the sender as a contact. The
+/// receiving I2P dispatcher then has no contact for the peer's
+/// destination and silently drops the frame. Without the retry the
+/// sender would never know — they'd never see the ACK and the room
+/// would be permanently broken between those two members.
+fn broadcast_sender_key(
+    _state: &AppState,
+    room_id_bytes: [u8; 16],
+    chain_seed: [u8; 32],
+    peers: Vec<Contact>,
+) {
+    for peer in peers {
+        spawn_send_room_sender_key_with_retry(room_id_bytes, chain_seed, peer);
+    }
+}
+
+fn spawn_send_room_sender_key_with_retry(
+    room_id_bytes: [u8; 16],
+    chain_seed: [u8; 32],
+    peer: Contact,
+) {
+    use uuid::Uuid;
+    let state_arc = match crate::commands::shared_state() {
+        Some(a) => a,
+        None => return,
+    };
+    let room_uuid = Uuid::from_bytes(room_id_bytes).to_string();
+    tokio::spawn(async move {
+        // Deterministic X3DH role assignment to avoid the "both sides
+        // simultaneously initiate" race that corrupts the ratchet
+        // state: the side with the SMALLER Ed25519 identity key
+        // initiates against the LARGER side. The larger side skips
+        // the broadcast — when the smaller side's RoomSenderKey
+        // first-message arrives, `run_decrypt` runs the X3DH
+        // responder, and the `reciprocate_sender_key` path inside
+        // `handle_outcome::RoomSenderKey` sends our seed back over
+        // the now-aligned ratchet.
+        //
+        // Scope: only matters when no pairwise ratchet exists yet.
+        // If we already have one (e.g., the peer is a pre-existing
+        // direct contact), there's no X3DH to race.
+        let has_pairwise = {
+            let guard = state_arc.vault.lock();
+            guard
+                .as_ref()
+                .and_then(|rt| crate::messaging::ratchet_store::load(&rt.db, &peer.id).ok().flatten())
+                .is_some()
+        };
+        if !has_pairwise {
+            let me_pub = {
+                let guard = state_arc.vault.lock();
+                guard
+                    .as_ref()
+                    .map(|rt| rt.identity.keys.ed25519_verifying().to_bytes())
+            };
+            if let Some(me) = me_pub {
+                if me.as_slice() > peer.ed25519_public.as_slice() {
+                    tracing::info!(
+                        "broadcast_sender_key: skipping initiator-side X3DH for `{}` (we have larger pubkey — peer will initiate, reciprocate will fire)",
+                        peer.alias
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Total retry budget ~5 minutes. Backoff schedule chosen so the
+        // first retry covers the typical I2P leaseset propagation +
+        // tunnel-build window (~5 s), and subsequent retries cover the
+        // long tail (slow first-launch reseed, peer briefly offline).
+        let backoffs = [0u64, 5, 15, 30, 60, 120, 180];
+        for (attempt, secs) in backoffs.iter().enumerate() {
+            tokio::time::sleep(std::time::Duration::from_secs(*secs)).await;
+
+            // Fast path: peer already ACK'd via an earlier attempt or
+            // via a different code path (e.g. they ACK'd before we
+            // even reached the first retry).
+            let acked = {
+                let guard = state_arc.vault.lock();
+                guard
+                    .as_ref()
+                    .and_then(|rt| {
+                        crate::messaging::room_keys::peer_has_acked_my_key(
+                            &rt.db,
+                            &room_uuid,
+                            &peer.id,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(false)
+            };
+            if acked {
+                tracing::debug!(
+                    "broadcast_sender_key: {} ACKed before attempt {}",
+                    peer.alias,
+                    attempt + 1
+                );
+                return;
+            }
+
+            if !try_send_room_sender_key_once(&state_arc, &room_id_bytes, &chain_seed, &peer)
+                .await
+            {
+                tracing::debug!(
+                    "broadcast_sender_key: attempt {} for {} did not deliver — will retry",
+                    attempt + 1,
+                    peer.alias
+                );
+            }
+        }
+        tracing::warn!(
+            "broadcast_sender_key: gave up after {} attempts for `{}` — peer never ACKed; their room messages may be undecryptable until next room invite",
+            backoffs.len(),
+            peer.alias
+        );
+    });
+}
+
+/// One attempt at sending the RoomSenderKey envelope to `peer`. Returns
+/// true on a successful network deposit (the caller still confirms via
+/// `peer_has_acked_my_key` on the next loop tick). Returns false on
+/// any kind of internal failure — bundle missing, ratchet failure, no
+/// I2P runtime — none of which are fatal across the retry budget.
+async fn try_send_room_sender_key_once(
+    state_arc: &std::sync::Arc<AppState>,
+    room_id_bytes: &[u8; 16],
+    chain_seed: &[u8; 32],
+    peer: &Contact,
+) -> bool {
+    use crate::crypto::message_crypto::{
+        build_aad, build_room_sender_key_envelope, pack_text_wire, pad_pkcs7, RatchetWire,
+    };
+    use crate::crypto::ratchet;
+    use crate::crypto::PAD_BLOCK;
+
+    let now_ms = now_unix_ms();
+    let envelope = build_room_sender_key_envelope(now_ms as u64, room_id_bytes, chain_seed);
+    let padded = pad_pkcs7(&envelope, PAD_BLOCK);
+
+    let prepared = {
+        let guard = state_arc.vault.lock();
+        let Some(rt) = guard.as_ref() else { return false };
+
+        let existing = crate::messaging::ratchet_store::load(&rt.db, &peer.id)
+            .ok()
+            .flatten();
+        let (mut state, session_init_blob) = match existing {
+            Some(s) => (s, None),
+            None => {
+                let bundle_bytes = match rt
+                    .db
+                    .get_contact_signed_bundle(&peer.id)
+                    .ok()
+                    .flatten()
+                {
+                    Some(b) => b,
+                    None => {
+                        tracing::warn!(
+                            "send_room_sender_key: no cached bundle for {} — cannot send",
+                            peer.alias
+                        );
+                        return false;
+                    }
+                };
+                let pb = match crate::crypto::bundle::deserialize(&bundle_bytes) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(
+                            "send_room_sender_key: bundle deserialize for {} failed: {e}",
+                            peer.alias
+                        );
+                        return false;
+                    }
+                };
+                match crate::messaging::sender::bootstrap_initiator_for(&rt.identity, &pb) {
+                    Ok((init, fresh)) => (fresh, Some(init)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "send_room_sender_key: bootstrap_initiator for {} failed: {e}",
+                            peer.alias
+                        );
+                        return false;
+                    }
+                }
+            }
+        };
+        let enc = match ratchet::encrypt_message(&mut state, &padded, build_aad) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        let inner_wire = match pack_text_wire(&RatchetWire {
+            ratchet_key: &enc.ratchet_key,
+            prev_chain_len: enc.prev_chain_len,
+            msg_num: enc.msg_num,
+            nonce: &enc.nonce,
+            ciphertext: &enc.ciphertext,
+            sentinel_digest: None,
+        }) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        let wire = match session_init_blob {
+            Some(init) => crate::crypto::pqx3dh::pack_first_message(&init, &inner_wire),
+            None => inner_wire,
+        };
+        let _ = crate::messaging::ratchet_store::save(&rt.db, &peer.id, &state);
+
+        let me_pub = rt.identity.keys.ed25519_verifying().to_bytes();
+        let sender_mb_hex =
+            crate::transport::mailbox::hex(&crate::transport::mailbox::current_mailbox(&me_pub));
+        let mut blob = Vec::with_capacity(32 + wire.len());
+        blob.extend_from_slice(sender_mb_hex.as_bytes());
+        blob.extend_from_slice(&wire);
+        Some(blob)
+    };
+
+    let Some(blob) = prepared else { return false };
+    let i2p_runtime = {
+        let slot = state_arc.i2p.lock().await;
+        slot.as_ref().cloned()
+    };
+    let Some(rt) = i2p_runtime else { return false };
+    let Some(dest) = peer.i2p_destination.as_deref() else {
+        return false;
+    };
+    let Ok(inner) = crate::transport::i2p::dispatch::strip_mailbox_prefix(&blob) else {
+        return false;
+    };
+    rt.connection
+        .send_blob(
+            dest,
+            crate::transport::i2p::framing::FrameType::Message,
+            inner,
+        )
+        .await
+        .is_ok()
 }
 
 /// Send our own room sender-key seed back to a peer who just shared theirs
@@ -1341,10 +1942,10 @@ fn reciprocate_sender_key(peer: &Contact, room_id: &[u8; 16]) {
             let mut blob = Vec::with_capacity(32 + wire.len());
             blob.extend_from_slice(sender_mb_hex.as_bytes());
             blob.extend_from_slice(&wire);
-            (blob, recipient_mb_hex, peer.relay_url.clone())
+            (blob, recipient_mb_hex)
         };
 
-        let (blob, _recipient_mb_hex, _target) = prepared;
+        let (blob, _recipient_mb_hex) = prepared;
         let i2p_runtime = {
             let slot = state_arc.i2p.lock().await;
             slot.as_ref().cloned()
@@ -1417,7 +2018,6 @@ fn persist_room_peer_as_contact(
     let guard = state.vault.lock();
     let rt = guard.as_ref().ok_or_else(|| anyhow!("vault locked"))?;
     let now = now_unix_ms();
-    let relay_url: Option<String> = None;
 
     // If we already know this peer (e.g. the contact-request that arrived
     // milliseconds before the bootstrap finished racing), reuse that row.
@@ -1434,13 +2034,11 @@ fn persist_room_peer_as_contact(
     };
     let contact = match existing {
         Some(mut c) => {
-            // Refresh the bundle-derived fields — the peer may have rotated
-            // their X25519 / ML-KEM keys, and the relay_url may have changed.
+            // Refresh the bundle-derived fields — the peer may have
+            // rotated their X25519 / ML-KEM keys or I2P destination.
             c.alias = bundle.alias.clone();
             c.x25519_public = bundle.x25519_key.to_vec();
             c.mlkem_public = bundle.kyber_key.clone();
-            c.relay_url = relay_url;
-            // Refresh the I2P destination too — peers can rotate.
             if i2p_destination.is_some() {
                 c.i2p_destination = i2p_destination.clone();
             }
@@ -1455,7 +2053,6 @@ fn persist_room_peer_as_contact(
                 ed25519_public: bundle.identity_key.to_vec(),
                 x25519_public: bundle.x25519_key.to_vec(),
                 mlkem_public: bundle.kyber_key.clone(),
-                relay_url,
                 i2p_destination: i2p_destination.clone(),
                 verified: false,
                 peer_has_verified_us: false,
@@ -1543,7 +2140,7 @@ async fn send_room_sender_key_to(
     let peer_clone = peer.clone();
 
     // Bootstrap initiator + encrypt + pack + deposit, all under a short lock.
-    let (blob, recipient_mb_hex, target_relay) = {
+    let (blob, recipient_mb_hex) = {
         let guard = state.vault.lock();
         let rt = guard.as_ref().ok_or_else(|| anyhow!("vault locked"))?;
         let me_pub = rt.identity.keys.ed25519_verifying().to_bytes();
@@ -1567,14 +2164,14 @@ async fn send_room_sender_key_to(
         let mut blob = Vec::with_capacity(32 + wire.len());
         blob.extend_from_slice(sender_mb_hex.as_bytes());
         blob.extend_from_slice(&wire);
-        (blob, recipient_mb_hex, peer_clone.relay_url.clone())
+        (blob, recipient_mb_hex)
     };
 
     // Send via I2P. The peer's i2p_destination must be on the contact
     // row from the bundle exchange — without it we have no way to
     // reach them and the room-key share is dropped (peer will see no
     // messages from us in this room until they re-pair).
-    let _ = (target_relay, recipient_mb_hex);
+    let _ = recipient_mb_hex;
     let i2p_runtime = {
         let slot = state.i2p.lock().await;
         slot.as_ref().cloned()
@@ -1610,6 +2207,37 @@ async fn handle_room_message(app: &AppHandle, state: &AppState, body: &[u8]) -> 
     let parsed: ParsedRoomWire = sender_key::parse_room_wire(body)
         .map_err(|e| anyhow!("parse room wire: {e}"))?;
     let room_uuid = Uuid::from_bytes(parsed.room_id).to_string();
+
+    // Inbound dedup: compute a hash of the wire blob and short-circuit
+    // if we've already inserted a message with the same hash in this
+    // room. Room messages are deterministic per (sender, counter), so
+    // duplicates produced by garlic-routing redundancy or peer retry
+    // would otherwise insert twice. The hash also protects against the
+    // sender-key chain advancing on a duplicate decrypt attempt.
+    let wire_hash = sha256_bytes(body);
+    {
+        let guard = state.vault.lock();
+        if let Some(rt) = guard.as_ref() {
+            let already_seen: Option<String> = rt
+                .db
+                .conn
+                .query_row(
+                    "SELECT id FROM messages
+                     WHERE conversation_id = ?1 AND wire_hash = ?2
+                     LIMIT 1",
+                    rusqlite::params![&room_uuid, wire_hash.as_slice()],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            if already_seen.is_some() {
+                tracing::debug!(
+                    "room: dropping duplicate ciphertext (wire_hash already seen) in room {}",
+                    &room_uuid[..8]
+                );
+                return Ok(());
+            }
+        }
+    }
 
     // Look up which contact this sender_pub belongs to + load their stored
     // sender-key state for this room. If we don't have a key for them yet
@@ -1710,7 +2338,7 @@ async fn handle_room_message(app: &AppHandle, state: &AppState, body: &[u8]) -> 
             },
             tee.as_deref(),
             None,
-            None,
+            Some(&wire_hash),
         );
         let _ = rt.db.conn.execute(
             "UPDATE conversations

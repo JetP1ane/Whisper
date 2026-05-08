@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { vaultLock, publishBundle } from "./hooks/useCrypto";
 import { TitleBar } from "./components/layout/TitleBar";
 import { Sidebar } from "./components/layout/Sidebar";
@@ -27,7 +28,9 @@ type Phase = "loading" | "intro" | "setup" | "alias_reveal" | "locked" | "ready"
 export default function App() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [quickSearchOpen, setQuickSearchOpen] = useState(false);
-  const [infoOpen, setInfoOpen] = useState(true);
+  // Hidden by default — Info is a "give me crypto details" affordance,
+  // not something you want occupying real estate during normal chat.
+  const [infoOpen, setInfoOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const refreshStatus = useAppStore((s) => s.refreshStatus);
@@ -60,26 +63,54 @@ export default function App() {
   }, [phase]);
 
   // Listen for backend events and refresh sidebar / active conversation.
+  // The handlers read `selectedId` from the store at event-fire time
+  // via `getState()` rather than via React closure capture so that a
+  // selection change doesn't leave a window where the wrong selection
+  // is consulted, and so we don't have to tear down and re-register
+  // listeners on every selection change.
   const loadConversations = useConversationStore((s) => s.loadConversations);
-  const selectedId = useConversationStore((s) => s.selectedId);
   const loadMessages = useConversationStore((s) => s.loadMessages);
   useEffect(() => {
     const unlistens: Array<() => void> = [];
-    listen<MessageReceivedPayload>("message:received", (e) => {
+    listen<MessageReceivedPayload>("message:received", async (e) => {
       const convId = e.payload.conversation_id;
+      const current = useConversationStore.getState().selectedId;
+      if (current === convId) {
+        // Conversation is open — mark it read FIRST, then refresh the
+        // sidebar. Order matters: if loadConversations races ahead it
+        // would briefly render with the un-decremented unread_count
+        // before the conversations:changed event fires from the
+        // backend's mark_read confirmation.
+        try {
+          await invoke("conversation_mark_read", { conversationId: convId });
+        } catch {
+          /* ignore — sidebar still re-fetches below */
+        }
+        loadMessages(convId);
+      }
       loadConversations();
-      if (selectedId === convId) loadMessages(convId);
+    }).then((u) => unlistens.push(u));
+    listen<unknown>("conversations:changed", () => {
+      loadConversations();
+    }).then((u) => unlistens.push(u));
+    listen<{ conversation_id: string }>("message:reaction", (e) => {
+      const current = useConversationStore.getState().selectedId;
+      if (current === e.payload.conversation_id) {
+        loadMessages(current);
+      }
     }).then((u) => unlistens.push(u));
     listen<{ sender_alias: string; conversation_id: string }>(
       "contact:received",
       () => loadConversations(),
     ).then((u) => unlistens.push(u));
     listen<{ message_id: string; status: string }>("message:status", () => {
-      if (selectedId) loadMessages(selectedId);
+      const current = useConversationStore.getState().selectedId;
+      if (current) loadMessages(current);
     }).then((u) => unlistens.push(u));
     listen<number>("messages:purged", () => {
       loadConversations();
-      if (selectedId) loadMessages(selectedId);
+      const current = useConversationStore.getState().selectedId;
+      if (current) loadMessages(current);
     }).then((u) => unlistens.push(u));
     listen<unknown>("rooms:changed", () => {
       loadConversations();
@@ -87,7 +118,7 @@ export default function App() {
     return () => {
       for (const u of unlistens) u();
     };
-  }, [selectedId, loadConversations, loadMessages]);
+  }, [loadConversations, loadMessages]);
 
   useKeyboard({
     onCmdK: () => setQuickSearchOpen((v) => !v),

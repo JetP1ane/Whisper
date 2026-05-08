@@ -30,6 +30,8 @@ interface ConversationSecurity {
   disappear_timer_secs: number | null;
   hardware_tier: string;
   safety_numbers: SafetyNumbers;
+  peer_i2p_destination: string | null;
+  i2p_tunnel_warm: boolean;
 }
 
 export function InfoPanel() {
@@ -37,6 +39,8 @@ export function InfoPanel() {
   const conversations = useConversationStore((s) => s.conversations);
   const messages = useConversationStore((s) => s.messages);
   const [security, setSecurity] = useState<ConversationSecurity | null>(null);
+  const [showSafetyNumber, setShowSafetyNumber] = useState(false);
+  const [showDeviceProtections, setShowDeviceProtections] = useState(false);
 
   const conv = conversations.find((c) => c.id === selectedId);
 
@@ -61,13 +65,14 @@ export function InfoPanel() {
   }
 
   const label = conversationLabel(conv);
+  const isRoom = conv.kind === "room";
 
   return (
     <aside className="w-[300px] flex-shrink-0 flex flex-col bg-bg-panel border-l border-border-subtle overflow-y-auto">
-      {/* Header */}
+      {/* Header — alias + truncated identity-key fingerprint. */}
       <div className="px-4 pt-4 pb-3 border-b border-border-subtle">
         <div className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary">
-          Peer
+          {isRoom ? "Room" : "Peer"}
         </div>
         <div className="mt-1 font-mono text-base text-text-primary truncate">{label}</div>
         {security?.peer_id_hex && (
@@ -77,10 +82,21 @@ export function InfoPanel() {
         )}
       </div>
 
-      {/* Encryption */}
+      {/* Transport: peer-to-peer, no central server. The architecturally
+          distinguishing feature of this app — surface it prominently. */}
+      {!isRoom && (
+        <Section label="Transport">
+          <CipherRow label="Network" value="I2P · peer-to-peer" ok />
+          <CipherRow label="Path" value="4 hops · garlic-encrypted" ok />
+        </Section>
+      )}
+
+      {/* Encryption — algorithms in use for this session. Compact one-line
+          rows. The post-quantum row gets the prominent green pill since
+          that's the most distinctive guarantee. */}
       <Section label="Encryption">
-        <CipherRow label="Cipher" value={security?.aead ?? "—"} ok />
-        <CipherRow label="DH (classical)" value={security?.kex_classical ?? "—"} ok />
+        <CipherRow label="AEAD" value={security?.aead ?? "—"} ok />
+        <CipherRow label="DH" value={security?.kex_classical ?? "—"} ok />
         <CipherRow
           label="DH (post-quantum)"
           value={security?.kex_pq ?? "Classical only"}
@@ -93,50 +109,18 @@ export function InfoPanel() {
             <span className="text-[10px] font-mono uppercase tracking-wider text-accent-400">
               Quantum protected
             </span>
-            <span className="text-[11px] font-mono text-accent-300">Kyber</span>
+            <span className="text-[11px] font-mono text-accent-300">ML-KEM-1024</span>
           </div>
         )}
       </Section>
 
-      {/* Forward secrecy */}
-      <Section label="Forward secrecy">
-        <Row label="Sent" value={<MonoNum n={security?.messages_sent ?? 0} />} />
-        <Row label="Received" value={<MonoNum n={security?.messages_received ?? 0} />} />
+      {/* Hardware integrity — the protections we apply at the device
+          + binary level. Expanded list because there's a real story
+          to tell (SE anchoring, Hardened Runtime, library validation,
+          i2pd binary pin, sandbox entitlements). */}
+      <Section label="Hardware integrity">
         <Row
-          label="Send chain"
-          value={<MonoNum n={security?.ratchet_send_chain_n ?? 0} />}
-        />
-        <Row
-          label="Receive chain"
-          value={<MonoNum n={security?.ratchet_recv_chain_n ?? 0} />}
-        />
-        <RatchetVisual
-          sent={security?.messages_sent ?? 0}
-          received={security?.messages_received ?? 0}
-        />
-        <p className="mt-2 text-[10px] text-text-tertiary leading-snug">
-          Each message uses a fresh key derived from the previous chain key (HKDF-SHA256).
-          Past messages stay safe even if the current key leaks.
-        </p>
-      </Section>
-
-      {/* Identity binding — cryptographic check of the alias↔key link */}
-      <Section label="Identity binding">
-        <Row
-          label="Alias ↔ key"
-          value={<Pill tone="ok">Bound</Pill>}
-        />
-        <p className="mt-1.5 text-[10px] text-text-tertiary leading-snug">
-          The alias is a deterministic hash of the public identity key.
-          Any peer who substitutes a different bundle for the same alias
-          fails verification on add — the binding is enforced locally.
-        </p>
-      </Section>
-
-      {/* Key storage */}
-      <Section label="Key storage">
-        <Row
-          label="Backed by"
+          label="Key binding"
           value={
             <span className="text-[11px] font-mono text-text-primary">
               {prettyTier(security?.hardware_tier)}
@@ -146,9 +130,159 @@ export function InfoPanel() {
         <p className="mt-1.5 text-[10px] text-text-tertiary leading-snug">
           {tierExplanation(security?.hardware_tier)}
         </p>
+        <button
+          onClick={() => setShowDeviceProtections((v) => !v)}
+          className="mt-2 w-full text-left text-[10px] font-mono uppercase tracking-wider text-text-tertiary hover:text-text-secondary flex items-center justify-between"
+        >
+          <span>Device protections</span>
+          <span className="text-text-tertiary">
+            {showDeviceProtections ? "▾" : "▸"}
+          </span>
+        </button>
+        {showDeviceProtections && (
+          <ul className="mt-2 space-y-1 text-[10px] text-text-secondary leading-snug">
+            <li className="flex gap-1.5">
+              <span className="text-status-ok">✓</span>
+              <span>Vault DEK + per-conversation TEE key derived from a hardware-bound seed in this Mac's Keychain (<span className="font-mono">kSecAttrAccessibleWhenUnlockedThisDeviceOnly</span>, non-syncable). The on-disk SQLCipher database can't be opened on another machine.</span>
+            </li>
+            <li className="flex gap-1.5">
+              <span className="text-status-ok">✓</span>
+              <span>Recovery phrase reveal requires re-entering your passphrase, then runs a fresh Argon2id derivation against the stored salt before unsealing.</span>
+            </li>
+            <li className="flex gap-1.5">
+              <span className="text-status-ok">✓</span>
+              <span>Hardened Runtime + library validation: macOS verifies every dylib's signature before load and blocks <span className="font-mono">DYLD_INSERT_LIBRARIES</span> injection. Verified empirically — Frida and lldb attach are denied by the OS.</span>
+            </li>
+            <li className="flex gap-1.5">
+              <span className="text-status-ok">✓</span>
+              <span>Bundled <span className="font-mono">i2pd</span> binary, dylibs, and reseed certs (27 files total) are SHA-256-pinned at build time and re-verified before every launch — any tampered file refuses to start.</span>
+            </li>
+            <li className="flex gap-1.5">
+              <span className="text-status-ok">✓</span>
+              <span>App sandbox active. JIT, debugger attach, and <span className="font-mono">DYLD_*</span> env vars all denied at the entitlement level.</span>
+            </li>
+            <li className="flex gap-1.5">
+              <span className="text-status-ok">✓</span>
+              <span>Webview CSP locked to <span className="font-mono">self</span> + IPC; no outbound HTTP from the UI is possible.</span>
+            </li>
+            <li className="flex gap-1.5">
+              <span className="text-status-ok">✓</span>
+              <span>Live egress audit in Settings → Security: every TCP/UDP socket from this app's PID and from the bundled i2pd subprocess is enumerated, with public-internet endpoints flagged.</span>
+            </li>
+          </ul>
+        )}
       </Section>
 
+      {/* Verification — the user-facing MITM defence. With the relay
+          gone, the central-server substitution attack is gone too,
+          but the *channel that delivered the whisper:// link* can
+          still be tampered with. Safety-number comparison out-of-band
+          remains the canonical answer. */}
+      {!isRoom && security?.safety_numbers.formatted && (
+        <Section label="Verification">
+          <Row
+            label="Status"
+            value={
+              security.is_verified ? (
+                <Pill tone="ok">Verified</Pill>
+              ) : (
+                <Pill tone="off">Unverified</Pill>
+              )
+            }
+          />
+          <p className="mt-1.5 text-[10px] text-text-tertiary leading-snug">
+            Whisper IDs are exchanged via{" "}
+            <span className="font-mono">whisper://</span> links you share
+            yourselves. If an attacker tampered with the channel that
+            carried the link, they could have swapped it for their own.
+            Compare these digits with your peer on a separate trusted
+            channel (in person, a phone call you trust). Matching digits
+            mean no one is in the middle.
+          </p>
+          {!showSafetyNumber ? (
+            <button
+              onClick={() => setShowSafetyNumber(true)}
+              className="mt-2 w-full text-[11px] font-mono uppercase tracking-wider text-accent-400 hover:text-accent-300 px-2 py-1.5 rounded-md border border-accent-500/20 bg-accent-500/5 hover:bg-accent-500/10"
+            >
+              Show safety number
+            </button>
+          ) : (
+            <div className="mt-2 space-y-2">
+              <div className="px-2 py-2 rounded-md bg-bg-inset border border-border-subtle">
+                <div className="font-mono text-[11px] text-text-primary leading-relaxed tracking-wider whitespace-pre-wrap">
+                  {security.safety_numbers.formatted}
+                </div>
+              </div>
+              <VerifyToggle
+                contactId={conv.contact_id}
+                isVerified={security.is_verified}
+                onChanged={() => {
+                  // Re-fetch the security summary so the pill updates.
+                  if (selectedId) {
+                    invoke<ConversationSecurity>(
+                      "conversation_security_summary",
+                      { conversationId: selectedId },
+                    )
+                      .then(setSecurity)
+                      .catch(() => {});
+                  }
+                }}
+              />
+            </div>
+          )}
+        </Section>
+      )}
+
     </aside>
+  );
+}
+
+function VerifyToggle({
+  contactId,
+  isVerified,
+  onChanged,
+}: {
+  contactId: string | null;
+  isVerified: boolean;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  if (!contactId) return null;
+  const flip = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await invoke("contact_verify", {
+        id: contactId,
+        verified: !isVerified,
+      });
+      onChanged();
+    } catch {
+      /* surface as unchanged state */
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (isVerified) {
+    return (
+      <button
+        onClick={flip}
+        disabled={busy}
+        className="w-full text-[11px] font-mono uppercase tracking-wider text-text-tertiary hover:text-text-secondary px-2 py-1.5 rounded-md border border-border-subtle bg-bg-inset hover:bg-bg-active disabled:opacity-40"
+        title="Reset the verification flag if the safety number ever changes (e.g. peer reinstalled)."
+      >
+        {busy ? "Resetting…" : "Reset verification"}
+      </button>
+    );
+  }
+  return (
+    <button
+      onClick={flip}
+      disabled={busy}
+      className="w-full text-[11px] font-mono uppercase tracking-wider text-status-ok hover:opacity-80 px-2 py-1.5 rounded-md border border-status-ok/30 bg-status-ok/10 hover:bg-status-ok/20 disabled:opacity-40"
+    >
+      {busy ? "Marking…" : "Mark as verified"}
+    </button>
   );
 }
 
@@ -186,9 +320,6 @@ function CipherRow({ label, value, ok }: { label: string; value: string; ok?: bo
   );
 }
 
-function MonoNum({ n }: { n: number }) {
-  return <span className="text-[11px] font-mono tabular-nums text-text-primary">{n}</span>;
-}
 
 function Pill({
   tone,
@@ -212,65 +343,15 @@ function Pill({
   );
 }
 
-function RatchetVisual({ sent, received }: { sent: number; received: number }) {
-  const total = sent + received;
-  if (total === 0) {
-    return (
-      <div className="mt-3 px-2 py-2 rounded-md bg-bg-inset border border-border-subtle text-[11px] text-text-tertiary text-center">
-        Send a message to start the ratchet
-      </div>
-    );
-  }
-  const cap = 24;
-  const sentDots = Math.min(sent, cap);
-  const recvDots = Math.min(received, cap);
-  return (
-    <div className="mt-3 space-y-2">
-      <DotRow label="↑" count={sentDots} total={cap} tone="accent" trailingNumber={sent} />
-      <DotRow label="↓" count={recvDots} total={cap} tone="ok" trailingNumber={received} />
-    </div>
-  );
-}
-
-function DotRow({
-  label,
-  count,
-  total,
-  tone,
-  trailingNumber,
-}: {
-  label: string;
-  count: number;
-  total: number;
-  tone: "accent" | "ok";
-  trailingNumber: number;
-}) {
-  const filled = tone === "accent" ? "bg-accent-400" : "bg-status-ok";
-  const empty = "bg-bg-active";
-  return (
-    <div className="flex items-center gap-2">
-      <span className="w-3 text-[10px] font-mono text-text-tertiary">{label}</span>
-      <div className="flex-1 flex items-center gap-[2px]">
-        {Array.from({ length: total }, (_, i) => (
-          <span
-            key={i}
-            className={`flex-1 h-1.5 rounded-sm ${i < count ? filled : empty}`}
-          />
-        ))}
-      </div>
-      <span className="w-6 text-right text-[10px] font-mono tabular-nums text-text-secondary">
-        {trailingNumber}
-      </span>
-    </div>
-  );
-}
-
 function prettyTier(t: string | undefined): string {
   switch (t) {
     case "secure_enclave_biometric":
-      return "Secure Enclave + Touch ID";
+      // Reserved tier for when sealed-conversation keys are gated by Touch ID.
+      // Currently unused — the always-on DB seed isn't biometric-gated, so
+      // we don't claim it. Kept for forward-compat with the Rust enum.
+      return "Hardware-bound + Touch ID";
     case "secure_enclave":
-      return "Secure Enclave";
+      return "Hardware-bound";
     case "software_only":
       return "Software";
     default:
@@ -281,13 +362,12 @@ function prettyTier(t: string | undefined): string {
 function tierExplanation(t: string | undefined): string {
   switch (t) {
     case "secure_enclave_biometric":
-      return "Your secret keys are anchored in your Mac's Secure Enclave — a separate chip that releases material only after Touch ID. Keys never leave the chip in plaintext, even to this app.";
+      return "Your seeds are stored in this Mac's Keychain with kSecAttrAccessibleWhenUnlockedThisDeviceOnly + Synchronizable=false, gated by a Touch ID prompt for sensitive operations. While the vault is unlocked, derived seeds live in this app's memory; locking the vault clears them.";
     case "secure_enclave":
-      return "Your secret keys are anchored in your Mac's Secure Enclave. Keys never leave the chip in plaintext.";
+      return "Your seeds are stored in this Mac's Keychain with kSecAttrAccessibleWhenUnlockedThisDeviceOnly + Synchronizable=false. The Keychain blob never leaves this device — copying the database file to another machine cannot decrypt your vault. While the vault is unlocked, derived seeds live in this app's memory; locking the vault clears them.";
     case "software_only":
-      return "Your secret keys are stored in the macOS login Keychain, encrypted at rest. (No Secure Enclave on this device.)";
+      return "Your seeds are stored in a per-profile config file, encrypted at rest with your vault passphrase. (Not running on macOS — no Keychain available.)";
     default:
       return "";
   }
 }
-

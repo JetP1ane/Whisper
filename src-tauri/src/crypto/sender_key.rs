@@ -41,7 +41,7 @@ use hkdf::Hkdf;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const ROOM_WIRE_MAGIC: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 pub const ROOM_ID_LEN: usize = 16;
@@ -170,25 +170,25 @@ pub fn decrypt(
         ));
     }
 
-    // Walk the chain forward until our counter equals target_counter.
-    // The message key for `target_counter` falls out of the final step.
+    // Walk the chain forward over messages we never received, zeroizing
+    // each skipped per-message key as we go (we don't cache them — the
+    // simplicity tradeoff). After the loop, `chain` is positioned to
+    // derive the message key for `target_counter` on the next step.
     let mut chain = state.chain_key;
-    let mut local_counter = state.counter;
-    let mut last_msg_key = Zeroizing::new([0u8; SK_KEY_LEN]);
-    while local_counter <= target_counter {
-        let (next_chain, msg_key) = derive_message_key(&chain);
-        if local_counter == target_counter {
-            *last_msg_key = msg_key;
-            chain = next_chain;
-            local_counter = local_counter.wrapping_add(1);
-            break;
-        }
+    for _ in 0..advance {
+        let (next_chain, mut skipped_mk) = derive_message_key(&chain);
+        skipped_mk.zeroize();
         chain = next_chain;
-        local_counter = local_counter.wrapping_add(1);
     }
 
+    // Derive the target message key on a local variable. Do NOT mutate
+    // `state` until aead_open succeeds — a forged ciphertext that
+    // survives framing must not be able to advance the chain.
+    let (next_after_target, msg_key) = derive_message_key(&chain);
+    let msg_key_z = Zeroizing::new(msg_key);
+
     let aad = build_aad(room_id, sender_pub, target_counter);
-    let cipher = ChaCha20Poly1305::new((&*last_msg_key).into());
+    let cipher = ChaCha20Poly1305::new((&*msg_key_z).into());
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(nonce),
@@ -199,8 +199,9 @@ pub fn decrypt(
         )
         .map_err(|_| CryptoError::AeadFailure)?;
 
-    state.chain_key = chain;
-    state.counter = local_counter;
+    // Commit only on success.
+    state.chain_key = next_after_target;
+    state.counter = target_counter.wrapping_add(1);
     Ok(plaintext)
 }
 

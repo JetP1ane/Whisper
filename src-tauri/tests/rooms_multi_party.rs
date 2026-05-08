@@ -42,7 +42,7 @@ use noctis_whisper_desktop_lib::crypto::{
     },
     message_crypto::{
         build_aad, build_room_invite_envelope, build_room_sender_key_envelope,
-        decode_envelope, pack_text_wire, pad_pkcs7, parse_wire, unpad_pkcs7,
+        decode_envelope, pack_attachment_wire, pad_pkcs7, parse_wire, unpad_pkcs7,
         DecodedEnvelope, RatchetWire,
     },
     pqx3dh::{self, InitiatorInputs, ResponderInputs},
@@ -255,12 +255,13 @@ fn parse_session_init(b: &[u8]) -> ParsedInit {
 // Pairwise envelope helpers
 // =====================================================================
 
-/// Encrypt a fully-padded envelope under `me`'s ratchet to `peer`. Returns
-/// the wire bytes (4096-byte text wire, no first-message wrapper).
+/// Encrypt a fully-padded envelope under `me`'s ratchet to `peer`. Uses
+/// the unbounded attachment wire so room invites with inline bundles
+/// fit; the receiver path doesn't care which packer was used.
 fn pairwise_encrypt(me_state: &mut RatchetState, envelope: &[u8]) -> Vec<u8> {
     let padded = pad_pkcs7(envelope, PAD_BLOCK);
     let enc = ratchet::encrypt_message(me_state, &padded, build_aad).unwrap();
-    pack_text_wire(&RatchetWire {
+    pack_attachment_wire(&RatchetWire {
         ratchet_key: &enc.ratchet_key,
         prev_chain_len: enc.prev_chain_len,
         msg_num: enc.msg_num,
@@ -268,7 +269,6 @@ fn pairwise_encrypt(me_state: &mut RatchetState, envelope: &[u8]) -> Vec<u8> {
         ciphertext: &enc.ciphertext,
         sentinel_digest: None,
     })
-    .unwrap()
 }
 
 /// Decrypt a 4096-byte text wire under `me`'s pairwise ratchet to peer.
@@ -331,10 +331,14 @@ fn simulate_room_create(owner: &mut Member, others: &mut [&mut Member]) {
     let owner_pub = owner.pubkey();
 
     // 2. Build member pubkey list.
-    let mut all_pubkeys = vec![owner_pub];
+    // The wire format now carries full member bundles — collect them once.
+    let mut all_bundle_bytes: Vec<Vec<u8>> = vec![bundle::serialize(&owner.bundle)];
     for o in others.iter() {
-        all_pubkeys.push(o.pubkey());
+        all_bundle_bytes.push(bundle::serialize(&o.bundle));
     }
+    let all_bundle_refs: Vec<&[u8]> =
+        all_bundle_bytes.iter().map(|b| b.as_slice()).collect();
+    let _ = owner_pub;
 
     // 3. Owner sends a RoomInvite envelope to every other member via the
     //    pairwise ratchet established above.
@@ -345,7 +349,7 @@ fn simulate_room_create(owner: &mut Member, others: &mut [&mut Member]) {
             ROOM_NAME,
             "",
             &owner_seed,
-            &all_pubkeys,
+            &all_bundle_refs,
         )
         .unwrap();
         let wire = {
@@ -359,7 +363,7 @@ fn simulate_room_create(owner: &mut Member, others: &mut [&mut Member]) {
         match decoded {
             DecodedEnvelope::RoomInvite {
                 owner_chain_seed,
-                member_pubkeys,
+                member_bundles,
                 ..
             } => {
                 assert_eq!(owner_chain_seed, owner_seed);
@@ -367,9 +371,8 @@ fn simulate_room_create(owner: &mut Member, others: &mut [&mut Member]) {
                 member
                     .peer_room_sks
                     .insert(owner_pub, SenderKey::from_seed(owner_chain_seed));
-                // Recipient learns the member list (we'll iterate to share
-                // our key with each non-self, non-owner peer below).
-                let _ = member_pubkeys;
+                // Recipient learns the member list (full bundles now).
+                let _ = member_bundles;
             }
             other => panic!("expected RoomInvite, got {:?}", other),
         }

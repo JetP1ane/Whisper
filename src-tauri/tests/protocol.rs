@@ -16,17 +16,14 @@ use noctis_whisper_desktop_lib::crypto::{
     message_crypto::{
         build_aad, build_attachment_envelope, build_delivery_receipt_envelope,
         build_room_invite_envelope, build_room_sender_key_envelope, build_text_envelope,
-        decode_envelope, pack_text_wire, pad_pkcs7, parse_wire, unpad_pkcs7,
-        DecodedEnvelope, RatchetWire,
+        decode_envelope, pack_attachment_wire, pack_text_wire, pad_pkcs7, parse_wire,
+        unpad_pkcs7, DecodedEnvelope, RatchetWire,
     },
     pqx3dh::{self, InitiatorInputs, ResponderInputs},
     ratchet::{self, RatchetState},
     safety_numbers,
     sender_key::{self as sk, SenderKey},
     PAD_BLOCK,
-};
-use noctis_whisper_desktop_lib::transport::frame_accounting::{
-    reconcile, AccountingVerdict, RelayCounters, Snapshot,
 };
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
@@ -534,98 +531,6 @@ fn config_manifest_signature_round_trip() {
 }
 
 #[test]
-fn frame_accounting_reconcile_expected_states() {
-    // Verified: client ahead is benign in-flight.
-    let v = reconcile(
-        Snapshot {
-            frames_sent: 10,
-            frames_received: 14,
-            bytes_sent: 0,
-            bytes_received: 0,
-        },
-        RelayCounters {
-            frames_received_from_client: 10,
-            frames_sent_to_client: 13,
-            bytes_received_from_client: 0,
-            bytes_sent_to_client: 0,
-        },
-    );
-    assert!(matches!(v, AccountingVerdict::Verified));
-
-    // Drop: relay sent more than client received.
-    let v = reconcile(
-        Snapshot {
-            frames_sent: 10,
-            frames_received: 5,
-            bytes_sent: 0,
-            bytes_received: 0,
-        },
-        RelayCounters {
-            frames_received_from_client: 10,
-            frames_sent_to_client: 8,
-            bytes_received_from_client: 0,
-            bytes_sent_to_client: 0,
-        },
-    );
-    assert!(matches!(v, AccountingVerdict::FrameDrop));
-
-    // Injection (exfil): relay claims to have received frames we never sent.
-    let v = reconcile(
-        Snapshot {
-            frames_sent: 5,
-            frames_received: 10,
-            bytes_sent: 0,
-            bytes_received: 0,
-        },
-        RelayCounters {
-            frames_received_from_client: 7,
-            frames_sent_to_client: 10,
-            bytes_received_from_client: 0,
-            bytes_sent_to_client: 0,
-        },
-    );
-    assert!(matches!(v, AccountingVerdict::FrameInjectionExfil));
-}
-
-#[test]
-fn whisper_link_with_relay_query_param_round_trip() {
-    let alice = Participant::new("alice");
-    let link = bundle::build_whisper_link(&alice.bundle);
-    assert!(link.starts_with("whisper://c/"));
-    assert!(link.contains("?relay="));
-    let parsed = bundle::parse_whisper_link(&link).unwrap();
-    assert_eq!(parsed.relay_url, "wss://test.example.com/ws");
-}
-
-#[test]
-fn whisper_link_relay_hint_must_match_signed_value() {
-    // Crafting a link whose `?relay=` hint disagrees with the signed
-    // bundle's `relay_url` is rejected.
-    let alice = Participant::new("alice");
-    let body = bundle::base58_encode(&bundle::serialize(&alice.bundle));
-    let bad = format!(
-        "whisper://c/{}?relay=wss%3A%2F%2Fevil.example.com%2Fws",
-        body
-    );
-    assert!(bundle::parse_whisper_link(&bad).is_err());
-}
-
-#[test]
-fn cross_relay_routing_decision() {
-    // Same-relay case (`bundle.relay_url` matches the sender's home).
-    fn decide(home: &str, contact: &str) -> Option<String> {
-        if !contact.is_empty() && contact != home {
-            Some(contact.to_string())
-        } else {
-            None
-        }
-    }
-    assert_eq!(decide("wss://x/ws", "wss://x/ws"), None);
-    assert_eq!(decide("wss://a/ws", "wss://b/ws").as_deref(), Some("wss://b/ws"));
-    assert_eq!(decide("wss://x/ws", ""), None);
-}
-
-#[test]
 fn alias_derivation_is_deterministic_and_in_wordlist() {
     let alice = Participant::new("alice");
     let pk = alice.keys.ed25519_verifying().to_bytes();
@@ -659,29 +564,35 @@ fn room_invite_envelope_round_trips_through_pairwise_ratchet() {
     let owner_seed: [u8; 32] = [0x11u8; 32];
     let alice_pub = alice.keys.ed25519_verifying().to_bytes();
     let bob_pub = bob.keys.ed25519_verifying().to_bytes();
+    // The wire format now carries full member bundles instead of bare
+    // pubkeys. Use the participants' own bundles as the payload.
+    let alice_bundle_bytes = bundle::serialize(&alice.bundle);
+    let bob_bundle_bytes = bundle::serialize(&bob.bundle);
     let envelope = build_room_invite_envelope(
         1234567,
         &room_id,
         "secret-club",
         "place to plot",
         &owner_seed,
-        &[alice_pub, bob_pub],
+        &[&alice_bundle_bytes, &bob_bundle_bytes],
     )
     .unwrap();
+    let _ = (alice_pub, bob_pub);
 
-    // Encrypt + decrypt over Alice→Bob ratchet.
+    // Encrypt + decrypt over Alice→Bob ratchet.  Use the unbounded
+    // attachment wire because the inline bundles (one per member) push
+    // the body well past the 4096-byte text-wire cap.
     let padded = pad_pkcs7(&envelope, PAD_BLOCK);
     let enc =
         ratchet::encrypt_message(alice.ratchet.as_mut().unwrap(), &padded, build_aad).unwrap();
-    let wire = pack_text_wire(&RatchetWire {
+    let wire = pack_attachment_wire(&RatchetWire {
         ratchet_key: &enc.ratchet_key,
         prev_chain_len: enc.prev_chain_len,
         msg_num: enc.msg_num,
         nonce: &enc.nonce,
         ciphertext: &enc.ciphertext,
         sentinel_digest: None,
-    })
-    .unwrap();
+    });
 
     let decoded = decrypt(bob.ratchet.as_mut().unwrap(), &wire);
     match decoded {
@@ -690,16 +601,16 @@ fn room_invite_envelope_round_trips_through_pairwise_ratchet() {
             name,
             description,
             owner_chain_seed,
-            member_pubkeys,
+            member_bundles,
             ..
         } => {
             assert_eq!(rid, room_id);
             assert_eq!(name, "secret-club");
             assert_eq!(description, "place to plot");
             assert_eq!(owner_chain_seed, owner_seed);
-            assert_eq!(member_pubkeys.len(), 2);
-            assert_eq!(member_pubkeys[0], alice_pub);
-            assert_eq!(member_pubkeys[1], bob_pub);
+            assert_eq!(member_bundles.len(), 2);
+            assert_eq!(member_bundles[0], alice_bundle_bytes);
+            assert_eq!(member_bundles[1], bob_bundle_bytes);
         }
         other => panic!("expected RoomInvite, got {:?}", other),
     }
@@ -832,4 +743,91 @@ fn room_ciphertext_rejects_wrong_chain_seed() {
         &enc.ciphertext,
     );
     assert!(result.is_err(), "decrypt with wrong seed must fail");
+}
+
+/// When ONLY one side initiates (the
+/// production `broadcast_sender_key` deterministic-role-assignment
+/// path), the responder bootstraps cleanly off the initiator's first
+/// message and the two ratchets share a master secret. Follow-up
+/// messages decrypt correctly. This is the post-fix behaviour we
+/// want to preserve.
+#[test]
+fn single_sided_x3dh_initiation_produces_aligned_ratchets() {
+    let mut alice = Participant::new("alice");
+    let mut bob = Participant::new("bob");
+
+    // Only alice initiates. Bob waits for her first message.
+    let (alice_init, _) = alice_initiator_bootstrap(&mut alice, &bob);
+
+    // Alice's first message: send a real envelope WITH her init bytes
+    // attached. We piggy-back on the ratchet we just built.
+    let envelope = build_text_envelope(0, "hello bob from alice");
+    let padded = pad_pkcs7(&envelope, PAD_BLOCK);
+    let enc = ratchet::encrypt_message(alice.ratchet.as_mut().unwrap(), &padded, build_aad)
+        .expect("alice encrypt");
+    let inner_wire = pack_text_wire(&RatchetWire {
+        ratchet_key: &enc.ratchet_key,
+        prev_chain_len: enc.prev_chain_len,
+        msg_num: enc.msg_num,
+        nonce: &enc.nonce,
+        ciphertext: &enc.ciphertext,
+        sentinel_digest: None,
+    })
+    .expect("pack");
+
+    // Bob does responder bootstrap and decrypts the inner wire.
+    let bob_state = bob_responder_bootstrap(&mut bob, &alice_init);
+    bob.ratchet = Some(bob_state);
+    let parsed = parse_wire(&inner_wire).expect("parse");
+    let plaintext = ratchet::decrypt_message(
+        bob.ratchet.as_mut().unwrap(),
+        &parsed.ratchet_key,
+        parsed.prev_chain_len,
+        parsed.msg_num,
+        &parsed.nonce,
+        &parsed.ciphertext,
+        build_aad,
+    )
+    .expect("bob decrypts alice's first message");
+    let unpadded = unpad_pkcs7(&plaintext).unwrap();
+    match decode_envelope(&unpadded).unwrap() {
+        DecodedEnvelope::Text { text, .. } => {
+            assert_eq!(text, "hello bob from alice");
+        }
+        other => panic!("expected text envelope, got {:?}", other),
+    }
+
+    // Bob's reply (the "reciprocate" path) goes back over the SAME
+    // ratchet — both sides' masters now match.
+    let reply_envelope = build_text_envelope(1, "hi alice from bob");
+    let reply_padded = pad_pkcs7(&reply_envelope, PAD_BLOCK);
+    let reply_enc = ratchet::encrypt_message(bob.ratchet.as_mut().unwrap(), &reply_padded, build_aad)
+        .expect("bob encrypt reply");
+    let reply_wire = pack_text_wire(&RatchetWire {
+        ratchet_key: &reply_enc.ratchet_key,
+        prev_chain_len: reply_enc.prev_chain_len,
+        msg_num: reply_enc.msg_num,
+        nonce: &reply_enc.nonce,
+        ciphertext: &reply_enc.ciphertext,
+        sentinel_digest: None,
+    })
+    .expect("pack reply");
+    let reply_parsed = parse_wire(&reply_wire).expect("parse reply");
+    let reply_plain = ratchet::decrypt_message(
+        alice.ratchet.as_mut().unwrap(),
+        &reply_parsed.ratchet_key,
+        reply_parsed.prev_chain_len,
+        reply_parsed.msg_num,
+        &reply_parsed.nonce,
+        &reply_parsed.ciphertext,
+        build_aad,
+    )
+    .expect("alice decrypts bob's reply — aligned ratchets");
+    let reply_unpadded = unpad_pkcs7(&reply_plain).unwrap();
+    match decode_envelope(&reply_unpadded).unwrap() {
+        DecodedEnvelope::Text { text, .. } => {
+            assert_eq!(text, "hi alice from bob");
+        }
+        other => panic!("expected text envelope, got {:?}", other),
+    }
 }

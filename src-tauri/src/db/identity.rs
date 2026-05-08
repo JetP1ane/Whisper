@@ -230,9 +230,20 @@ impl Database {
         }
     }
 
+    /// Mark a one-time prekey as consumed AND erase its secret material
+    /// from the row. Once a peer has used it for PQ-X3DH key agreement,
+    /// the long-lived secret has done its job and serves only as a
+    /// liability — keeping it on disk lets a future vault compromise
+    /// retroactively unmask all sessions established under it. We
+    /// preserve the row (as a cheap bloom filter against an attacker
+    /// reusing the same OTPK id twice) but zero the secret blobs.
     pub fn mark_one_time_prekey_consumed(&self, id: u32) -> DbResult<()> {
         self.conn.execute(
-            "UPDATE one_time_prekeys SET consumed = 1 WHERE id = ?1",
+            "UPDATE one_time_prekeys
+                SET consumed = 1,
+                    x25519_secret = zeroblob(0),
+                    mlkem_secret = zeroblob(0)
+                WHERE id = ?1",
             params![id],
         )?;
         Ok(())

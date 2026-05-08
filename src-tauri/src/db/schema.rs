@@ -69,10 +69,9 @@ CREATE TABLE IF NOT EXISTS contacts (
     ed25519_public        BLOB NOT NULL,
     x25519_public         BLOB NOT NULL,
     mlkem_public          BLOB NOT NULL,
-    relay_url             TEXT,
     -- I2P destination of the contact (base64). Populated from the signed
-    -- contact bundle exchange. The relay_url column above is now optional
-    -- and only set for legacy bundles; new bundles carry i2p_destination.
+    -- contact bundle exchange. The legacy relay_url column was dropped
+    -- when the desktop client went I2P-only.
     i2p_destination       TEXT,
     verified              INTEGER NOT NULL DEFAULT 0,
     peer_has_verified_us  INTEGER NOT NULL DEFAULT 0,
@@ -193,6 +192,42 @@ CREATE TABLE IF NOT EXISTS i2p_send_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_i2p_send_queue_status ON i2p_send_queue(status, last_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_i2p_send_queue_contact ON i2p_send_queue(contact_id, status);
+
+-- Per-room outbound buffer for messages we couldn't fan out to a member
+-- yet because they haven't ACK'd our sender-key share. Drained by
+-- `messaging::inbound::handle_room_sender_key_ack` when the missing
+-- ACK arrives. Closes the race where the very first room message
+-- could arrive at a fresh co-participant before our pairwise ratchet
+-- bootstrap completed and they'd silently drop the ciphertext.
+CREATE TABLE IF NOT EXISTS room_pending_fanout (
+    id           TEXT PRIMARY KEY,
+    room_id      TEXT NOT NULL,
+    contact_id   TEXT NOT NULL,
+    msg_id       TEXT NOT NULL,
+    blob         BLOB NOT NULL,
+    created_at   INTEGER NOT NULL,
+    FOREIGN KEY (room_id) REFERENCES conversations(id) ON DELETE CASCADE,
+    FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_room_pending_fanout_target
+  ON room_pending_fanout(room_id, contact_id, created_at);
+
+-- Per-message emoji reactions. Both local and remote reactions land
+-- here; `reactor_alias` is "self" for our own reactions and the
+-- peer's alias for inbound ones. A given (message_id, reactor_alias,
+-- emoji) tuple is unique — re-reacting with the same emoji is a
+-- no-op, and removing a reaction is `DELETE WHERE …`.
+CREATE TABLE IF NOT EXISTS message_reactions (
+    id              TEXT PRIMARY KEY,
+    message_id      TEXT NOT NULL,
+    reactor_alias   TEXT NOT NULL,
+    emoji           TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    UNIQUE (message_id, reactor_alias, emoji),
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_message_reactions_msg
+  ON message_reactions(message_id);
 "#;
 
 pub fn apply(conn: &Connection) -> DbResult<()> {
@@ -211,6 +246,22 @@ pub fn apply(conn: &Connection) -> DbResult<()> {
     // Surfaced in the chat bubble as a small icon so the user can see
     // which transport actually moved each byte.
     let _ = conn.execute("ALTER TABLE messages ADD COLUMN delivery_transport TEXT", []);
+    // Cached serialized v3 bundle for the contact (signed, full prekey
+    // material). Required so message_send can bootstrap a ratchet on
+    // first message without going to a relay registry — that path is
+    // gone in I2P-only mode.
+    let _ = conn.execute("ALTER TABLE contacts ADD COLUMN signed_bundle BLOB", []);
+    // Drop legacy relay_url column on existing DBs. Tolerant of the
+    // "no such column" error so it's a no-op on fresh DBs that never
+    // had the column, and on DBs that have already been migrated.
+    let _ = conn.execute("ALTER TABLE contacts DROP COLUMN relay_url", []);
+    // Per-(room, peer) timestamp recording when that peer ACK'd our
+    // sender-key share for that room. Used by `room_send` to decide
+    // whether to fan out immediately or buffer in `room_pending_fanout`.
+    let _ = conn.execute(
+        "ALTER TABLE room_members ADD COLUMN peer_acked_my_key_at INTEGER",
+        [],
+    );
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?1)",
         [CURRENT_VERSION.to_string()],

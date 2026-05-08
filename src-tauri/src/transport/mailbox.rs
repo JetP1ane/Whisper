@@ -62,7 +62,11 @@ pub fn build_retrieve_batch(real_mailbox: &[u8; MAILBOX_LEN]) -> Vec<[u8; MAILBO
     batch.push(*real_mailbox);
     for _ in 0..7 {
         let mut decoy = [0u8; MAILBOX_LEN];
-        rand::thread_rng().fill_bytes(&mut decoy);
+        // M-1: decoy mailboxes are part of the anti-correlation surface
+        // — pull from OsRng so a network observer can't distinguish a
+        // decoy from a real mailbox by clocking thread_rng's reseed
+        // cadence.
+        rand::rngs::OsRng.fill_bytes(&mut decoy);
         batch.push(decoy);
     }
     shuffle_in_place(&mut batch);

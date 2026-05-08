@@ -20,7 +20,7 @@ export function RoomList() {
           key={c.id}
           onClick={() => select(c.id)}
           className={`flex items-center gap-2 px-3 py-2 rounded-md text-left
-            ${selectedId === c.id ? "bg-bg-active" : "hover:bg-bg-hover"}`}
+            ${selectedId === c.id ? "bg-gray-800" : "hover:bg-bg-hover"}`}
         >
           <span className="w-7 h-7 rounded-md bg-bg-active border border-border-subtle flex items-center justify-center text-[11px] text-text-secondary">
             #
@@ -28,9 +28,14 @@ export function RoomList() {
           <div className="flex-1 min-w-0">
             <div className="text-sm text-text-primary truncate">{c.room_name}</div>
             <div className="text-[11px] text-text-tertiary truncate">
-              {c.unread_count > 0 ? `${c.unread_count} new` : "—"}
+              {c.unread_count > 0 ? `${c.unread_count} new` : "-"}
             </div>
           </div>
+          {c.unread_count > 0 && (
+            <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-accent-500 text-black text-[10px] font-mono font-bold flex items-center justify-center">
+              {c.unread_count > 99 ? "99+" : c.unread_count}
+            </span>
+          )}
         </button>
       ))}
     </div>

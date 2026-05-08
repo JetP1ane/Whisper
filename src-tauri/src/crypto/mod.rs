@@ -89,6 +89,19 @@ pub const TYPE_FLAG_ROOM_SENDER_KEY: u8 = 0x05;
 /// the relay nor a network adversary can strip or extend the timer
 /// without breaking the AEAD tag. Compliant clients enforce.
 pub const TYPE_FLAG_DETONATING_TEXT: u8 = 0x06;
+/// Inner control envelope: acknowledgement that we received and stored
+/// a peer's `TYPE_FLAG_ROOM_SENDER_KEY` for the named room. The peer
+/// uses this to know it's safe to start fanning room messages out to
+/// us (otherwise their first message can land before we've persisted
+/// their key, and we can't decrypt it). Payload: `[8B ts][1B 0x07][16B room_id]`.
+pub const TYPE_FLAG_ROOM_SENDER_KEY_ACK: u8 = 0x07;
+/// Inner control envelope: an emoji reaction to a previously-exchanged
+/// message. The target message is identified by its `wire_hash` —
+/// SHA-256 of the deposited blob bytes — which both sides can compute
+/// independently. The remove flag (1B) toggles between adding and
+/// removing the reaction; both directions are idempotent on the DB.
+/// Payload: `[8B ts][1B 0x08][32B target_wire_hash][1B remove_flag][2B emoji_len][emoji UTF-8]`.
+pub const TYPE_FLAG_MESSAGE_REACTION: u8 = 0x08;
 
 // --- Skipped-message bounds ---
 pub const MAX_SKIP_PER_CHAIN: u32 = 1000;

@@ -1,21 +1,41 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
-import { DisplayMessage } from "../../stores/conversationStore";
+import { DisplayMessage, ReactionGroup } from "../../stores/conversationStore";
 import { formatTime, formatBytes } from "../../utils/formatters";
+
+const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "🎉"];
 
 export function MessageBubble({ m }: { m: DisplayMessage }) {
   const align = m.is_outbound ? "items-end" : "items-start";
+  // Solid matte fills following the iMessage / Signal / Telegram
+  // dark-mode pattern: both bubbles dark, both light text. The
+  // sender's blue tint is the only saturated colour on screen,
+  // which keeps the visual hierarchy correct ("my messages stand
+  // out, theirs sit in the chrome").
+  //   sender   → blue-600 (#2563EB) with white text  — passes WCAG AA
+  //   receiver → gray-800 (#1F2937) with white text  — passes WCAG AA
   const bg = m.is_outbound
-    ? "bg-accent-500/10 border border-accent-500/20"
-    : "bg-bg-raised border border-border-subtle";
+    ? "bg-blue-600 border border-blue-600 text-white"
+    : "bg-gray-800 border border-gray-800 text-white";
+  // Faded variant of the bubble's foreground colour, used for the
+  // sender alias header, timestamp + status row, and "decryption
+  // pending" italic. Both bubbles share the white-with-alpha
+  // treatment now — they have the same body text colour.
+  const subtleClass = "text-white/70";
 
   const [now, setNow] = useState(() => Date.now());
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  // Tick once a second when the bubble has either a disappearing
+  // timer OR an outbound queued status — the latter is so the label
+  // can transition from "Sending…" → "Queued · trying" → "Recipient
+  // offline" without the user having to reload anything.
+  const isOutboundQueued = m.is_outbound && m.status === "queued";
   useEffect(() => {
-    if (m.disappear_at === null) return;
+    if (m.disappear_at === null && !isOutboundQueued) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [m.disappear_at]);
+  }, [m.disappear_at, isOutboundQueued]);
 
   // Defense in depth: regardless of the backend sweep timing, hide the
   // bubble locally as soon as the AEAD-embedded TTL elapses. The DB sweep
@@ -24,12 +44,33 @@ export function MessageBubble({ m }: { m: DisplayMessage }) {
     return null;
   }
 
+  const onContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY });
+  };
+
+  const react = async (emoji: string, remove: boolean) => {
+    setMenu(null);
+    try {
+      await invoke("message_react", {
+        messageId: m.id,
+        emoji,
+        remove,
+      });
+    } catch {
+      /* swallow — bubble re-renders on next message:reaction event */
+    }
+  };
+
   return (
     <div className={`flex flex-col ${align}`}>
-      <div className={`max-w-[70%] px-3 py-2 rounded-lg ${bg}`}>
+      <div
+        className={`max-w-[70%] px-3 py-2 rounded-lg ${bg}`}
+        onContextMenu={onContextMenu}
+      >
         {!m.is_outbound && (
           <div
-            className={`text-[10px] tracking-wider text-text-tertiary mb-0.5 ${
+            className={`text-[10px] tracking-wider ${subtleClass} mb-0.5 ${
               m.sender_nickname ? "" : "font-mono uppercase"
             }`}
           >
@@ -39,63 +80,144 @@ export function MessageBubble({ m }: { m: DisplayMessage }) {
         {m.is_attachment ? (
           <AttachmentRow m={m} />
         ) : (
-          <div className="text-[13px] leading-relaxed text-text-primary whitespace-pre-wrap break-words">
-            {m.text ?? <span className="text-text-tertiary italic">decryption pending</span>}
+          <div className="text-[13px] leading-relaxed whitespace-pre-wrap break-words">
+            {m.text ?? <span className={`${subtleClass} italic`}>decryption pending</span>}
           </div>
         )}
-        <div className="flex items-center gap-1.5 mt-1 text-[10px] text-text-tertiary">
+        <div className={`flex items-center gap-1.5 mt-1 text-[10px] ${subtleClass}`}>
           <span>{formatTime(m.created_at)}</span>
           {m.is_outbound && (
-            <span
-              className={
-                m.status === "delivered"
-                  ? "text-status-ok"
-                  : m.status === "failed"
-                  ? "text-status-err"
-                  : "text-text-tertiary"
-              }
-            >
-              · {prettyStatus(m.status)}
-            </span>
-          )}
-          {m.is_outbound && m.delivery_transport && (
-            <TransportBadge transport={m.delivery_transport} />
+            <OutboundStatusBadge m={m} now={now} />
           )}
           {m.disappear_at !== null && (
             <DetonateBadge deadline={m.disappear_at} now={now} />
           )}
         </div>
       </div>
+      {m.reactions.length > 0 && (
+        <ReactionRow
+          reactions={m.reactions}
+          align={m.is_outbound ? "end" : "start"}
+          onToggle={(emoji, mine) => react(emoji, mine)}
+        />
+      )}
+      {menu && (
+        <ReactionMenu
+          x={menu.x}
+          y={menu.y}
+          existing={m.reactions}
+          onPick={(emoji) => {
+            const own = m.reactions.find((r) => r.emoji === emoji && r.mine);
+            react(emoji, !!own);
+          }}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </div>
   );
 }
 
-function TransportBadge({ transport }: { transport: string }) {
-  // I2P is the privacy-preserving primary transport; relay is the
-  // fallback. Use distinct icons + colors so the user can see at a
-  // glance which path each send actually took.
-  if (transport === "i2p") {
-    return (
-      <span
-        className="text-accent-400 font-mono"
-        title="Delivered via I2P (peer-to-peer, no relay)"
-      >
-        · I2P
-      </span>
-    );
-  }
-  if (transport === "relay") {
-    return (
-      <span
-        className="text-text-tertiary font-mono"
-        title="Delivered via relay fallback (I2P unreachable)"
-      >
-        · relay
-      </span>
-    );
-  }
-  return null;
+function ReactionRow({
+  reactions,
+  align,
+  onToggle,
+}: {
+  reactions: ReactionGroup[];
+  align: "start" | "end";
+  onToggle: (emoji: string, mine: boolean) => void;
+}) {
+  return (
+    <div
+      className={`mt-1 flex flex-wrap gap-1 ${
+        align === "end" ? "justify-end" : "justify-start"
+      }`}
+    >
+      {reactions.map((r) => (
+        <button
+          key={r.emoji}
+          onClick={() => onToggle(r.emoji, r.mine)}
+          className={`text-[11px] px-1.5 py-0.5 rounded-full border transition-colors ${
+            r.mine
+              ? "bg-accent-500/15 border-accent-500/40 text-text-primary"
+              : "bg-bg-inset border-border-subtle text-text-secondary hover:bg-bg-hover"
+          }`}
+          title={r.mine ? "You reacted — click to remove" : "Click to add"}
+        >
+          {r.emoji}
+          {r.count > 1 && (
+            <span className="ml-1 font-mono tabular-nums text-[10px] text-text-tertiary">
+              {r.count}
+            </span>
+          )}
+        </button>
+      ))}
+    </div>
+  );
 }
+
+function ReactionMenu({
+  x,
+  y,
+  existing,
+  onPick,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  existing: ReactionGroup[];
+  onPick: (emoji: string) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest("[data-reaction-menu]")) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  // Clamp inside viewport so we don't render off-screen.
+  const left = Math.min(x, window.innerWidth - 280);
+  const top = Math.min(y, window.innerHeight - 60);
+
+  return (
+    <div
+      data-reaction-menu
+      className="fixed z-50 bg-bg-panel border border-border-default rounded-lg shadow-xl px-2 py-1.5 flex items-center gap-1 animate-fade-in"
+      style={{ left, top }}
+    >
+      {QUICK_REACTIONS.map((emoji) => {
+        const own = existing.find((r) => r.emoji === emoji && r.mine);
+        return (
+          <button
+            key={emoji}
+            onClick={() => onPick(emoji)}
+            className={`text-lg px-1.5 py-0.5 rounded transition-colors ${
+              own
+                ? "bg-accent-500/20 hover:bg-accent-500/30"
+                : "hover:bg-bg-hover"
+            }`}
+            title={own ? "Remove your reaction" : "React"}
+          >
+            {emoji}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// (TransportBadge removed: I2P is the only transport, so the "· I2P"
+// suffix on every delivered message was redundant. The relay branch
+// was dead code from the pre-I2P-only era.)
 
 function DetonateBadge({ deadline, now }: { deadline: number; now: number }) {
   const remaining = Math.max(0, deadline - now);
@@ -117,19 +239,84 @@ function formatRemaining(ms: number): string {
   return `${d}d`;
 }
 
-function prettyStatus(s: string): string {
-  switch (s) {
-    case "queued":
-      return "Sending";
-    case "sent":
-      return "Sent";
-    case "delivered":
-      return "Delivered";
-    case "failed":
-      return "Failed";
-    default:
-      return s;
+/// Bubble status renderer.
+///
+/// Splits the generic `queued` state into three honest sub-states
+/// based on local outbox observables (no presence beacons, no wire
+/// signal). The user's biggest pain point — "Sending" sticking for 15
+/// minutes — comes from collapsing all of these into one label. Now:
+///
+///   - first ~10s after send, no attempts yet  →  "Sending…"
+///   - 1+ failed attempts, last try was recent →  "Queued · retrying"
+///   - 5+ failed attempts OR last try >2 min ago → "Recipient offline"
+///   - sent / delivered / failed                →  unchanged
+///
+/// All thresholds derived from `attempt_count` + `last_attempt_at`
+/// surfaced by `conversation_messages`. The bubble re-renders every
+/// second while `status === 'queued'` so transitions are visible
+/// without a manual refresh.
+function OutboundStatusBadge({
+  m,
+  now,
+}: {
+  m: DisplayMessage;
+  now: number;
+}) {
+  // Status text is rendered inside the sender bubble (always outbound).
+  // The bubble's white text colour cascades through; we deliberately
+  // drop the per-state colour overrides (emerald for delivered, red
+  // for failed, tertiary-grey for the rest) so every state reads in
+  // the same matte white the rest of the bubble uses. Differentiation
+  // is by the label text itself + the hover-tooltip.
+  if (m.status === "delivered") {
+    return <span>· Delivered</span>;
   }
+  if (m.status === "failed") {
+    return <span title="Send failed. The recipient may be offline; the queue will keep trying.">· Failed</span>;
+  }
+  if (m.status === "sent") {
+    return <span>· Sent</span>;
+  }
+  // status === "queued"
+  const attempts = m.attempt_count ?? 0;
+  const lastAt = m.last_attempt_at;
+  const ageSecs = lastAt ? Math.floor((now - lastAt) / 1000) : null;
+
+  // Phase A: no attempts yet. Either we're still inside the inline
+  // try_i2p_deliver retry ladder (~7s) or the message just hit the
+  // queue and the next worker tick is imminent.
+  if (attempts === 0) {
+    return <span title="Establishing route to recipient.">· Sending…</span>;
+  }
+
+  // Phase C: enough failures that we should tell the user the
+  // recipient appears offline. Threshold tuned to match the queue
+  // worker's backoff (5,15,30,60,300s) — by attempt 5 we're at the
+  // 300s plateau, and any attempt older than 120s means the worker
+  // is in a long backoff sleep.
+  const offline = attempts >= 5 || (ageSecs !== null && ageSecs >= 120);
+  if (offline) {
+    return (
+      <span
+        title={`Recipient hasn't been reachable. ${attempts} attempts, last ${
+          ageSecs !== null ? `${ageSecs}s ago` : "in progress"
+        }. Will keep retrying for up to 30 days.`}
+      >
+        · Recipient offline · retrying
+      </span>
+    );
+  }
+
+  // Phase B: actively retrying within the short backoff window.
+  return (
+    <span
+      title={`Attempt ${attempts}, last ${
+        ageSecs !== null ? `${ageSecs}s ago` : "in progress"
+      }. Recipient may be offline.`}
+    >
+      · Queued · retrying
+    </span>
+  );
 }
 
 function AttachmentRow({ m }: { m: DisplayMessage }) {

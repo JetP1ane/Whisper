@@ -5,7 +5,7 @@
 @layer base {
   :root {
     color-scheme: dark;
-    --titlebar-h: 36px;
+    --titlebar-h: 56px;
 
     /* Dark palette (default). RGB channels (no commas) so Tailwind's
        <alpha-value> mechanism can compose opacities. */
@@ -81,6 +81,14 @@
     user-select: none;
   }
 
+  /* Logo background tile is solid black for the dark palette. In
+     light mode the tile would clash with the surface, so we hide it
+     and let the bars composite onto the page directly. CSS scopes
+     the toggle by the `:root.light` class set by useTheme().applyTheme(). */
+  :root.light .whisper-icon-tile {
+    display: none;
+  }
+
   .panel {
     @apply bg-bg-panel border-border-subtle;
   }
@@ -91,7 +99,12 @@
            focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-500/40;
   }
   .btn-primary {
-    @apply btn bg-accent-500 text-black hover:bg-accent-400 active:bg-accent-600;
+    /* Same blue as the sender chat bubble (`bg-blue-600` = #2563EB).
+       Matching the message-action button to the message colour gives
+       the chat view a clean two-colour story (blue = action, gray =
+       chrome). Gold accent stays brand-wide for badges, pills, focus
+       rings, and unread-count chips in the sidebar. */
+    @apply btn bg-blue-600 text-white hover:bg-blue-500 active:bg-blue-700;
   }
   .btn-secondary {
     @apply btn bg-bg-raised text-text-primary border border-border-default

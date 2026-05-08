@@ -27,19 +27,32 @@ export default {
           tertiary: "rgb(var(--text-tertiary) / <alpha-value>)",
           disabled: "rgb(var(--text-disabled) / <alpha-value>)",
         },
-        // Noctis Whisper brand emerald, anchored on #10b981 at the 500 step.
+        // Noctis Whisper brand gold, anchored on #F6B32D at the 500 step.
+        // Steps follow HSL(40, 92%, L%) with L sweeping 96 → 18 across
+        // 50 → 900, matching Tailwind's standard neutral progression
+        // shape so existing utility classes (e.g. `bg-accent-500/10`)
+        // produce predictable contrast.
         accent: {
-          50: "#ecfdf5",
-          100: "#d1fae5",
-          200: "#a7f3d0",
-          300: "#6ee7b7",
-          400: "#34d399",
-          500: "#10b981",
-          600: "#059669",
-          700: "#047857",
-          800: "#065f46",
-          900: "#064e3b",
+          50: "#fdf6e6",
+          100: "#fbe9c1",
+          200: "#f8d894",
+          300: "#f6c768",
+          400: "#f6bd4a",
+          500: "#f6b32d",
+          600: "#d8951a",
+          700: "#ab7515",
+          800: "#7d5610",
+          900: "#533a08",
         },
+        // Neutral muted tone for chrome: timestamps, secondary metadata,
+        // dividers, pill backgrounds where the accent gold would be too
+        // loud. #8F8F8F is exactly mid-grey, readable on both the dark
+        // and light surfaces.
+        muted: "#8F8F8F",
+        // Semantic state colors. status.ok stays emerald deliberately —
+        // it's the universal "all good / connected / delivered" signal,
+        // and merging it with the gold brand accent would muddy the
+        // affordance. Change later if you want gold-as-success too.
         status: {
           ok: "#10b981",
           warn: "#f59e0b",

@@ -199,6 +199,24 @@ impl Database {
         Ok(())
     }
 
+    /// Have we already inserted an *inbound* message with this wire_hash?
+    /// Used by the inbound dispatcher to short-circuit retransmissions:
+    /// when a peer retries the same encrypted blob (because the original
+    /// ACK was lost in transit), we want to re-emit the ACK and skip the
+    /// ratchet decrypt — otherwise, the responder bootstrap path would
+    /// fail with "OTPK already consumed" and the peer's queue would
+    /// never see a delivered status.
+    pub fn inbound_message_exists_by_wire_hash(&self, wire_hash: &[u8]) -> DbResult<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE wire_hash = ?1 AND is_outbound = 0
+             LIMIT 1",
+            params![wire_hash],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Flip an outbound message's status to `delivered` by matching the
     /// SHA-256 of the original deposited wire blob. Returns the row id if
     /// we found and updated it.
