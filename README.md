@@ -19,6 +19,10 @@ For the architecture and the threat model, see
 [`WHITEPAPER.md`](WHITEPAPER.md). For the high-level version, see
 [`LITEPAPER.md`](LITEPAPER.md).
 
+<p align="center">
+  <img src="public/Demo01.gif" alt="Noctis Whisper demo" width="720" />
+</p>
+
 ## Install
 
 Apple Silicon Macs running macOS 12+. Single command — Homebrew will
