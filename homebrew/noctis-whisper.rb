@@ -17,14 +17,10 @@
 cask "noctis-whisper" do
   version "0.1.0"
 
-  on_arm do
-    sha256 "REPLACE_WITH_ARM64_SHA256"
-    url "https://github.com/JetP1ane/Whisper/releases/download/v#{version}/Noctis_Whisper_#{version}_aarch64.dmg"
-  end
-  on_intel do
-    sha256 "REPLACE_WITH_X86_SHA256"
-    url "https://github.com/JetP1ane/Whisper/releases/download/v#{version}/Noctis_Whisper_#{version}_x64.dmg"
-  end
+  # Apple Silicon-only for v0.1.0 — Intel build to follow.
+  depends_on arch: :arm64
+  sha256 "a536d124532dda852967b790c1ac3b5a16a80744d7efa7992da2b86fd016aba9"
+  url "https://github.com/JetP1ane/Whisper/releases/download/v#{version}/Noctis_Whisper_#{version}_aarch64.dmg"
 
   name "Noctis Whisper"
   desc "Privacy-focused desktop messenger with hybrid post-quantum E2EE over I2P"
