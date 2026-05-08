@@ -165,12 +165,40 @@ for dylib in "$LIB_DIR"/*.dylib; do
   rewrite_loads "$dylib"
 done
 
-# --- Re-sign. install_name_tool invalidates the original signatures, and
-#     Apple Silicon kernel KILLs unsigned mach-o on launch. We clear and
-#     ad-hoc re-sign each file. Tauri's final build pass re-signs the
-#     whole .app with whatever identity is configured (Developer ID for
-#     production), which supersedes our ad-hoc sigs. ---
-echo "→ ad-hoc re-signing"
+# --- Re-sign. install_name_tool invalidates the original signatures,
+#     and Apple Silicon kernel KILLs unsigned mach-o on launch. Tauri's
+#     final build pass only signs the main executable and outer .app
+#     bundle — it does NOT recurse into Contents/Resources/, so any
+#     nested mach-o we drop in here keeps whatever signature it has
+#     when this script exits. Apple's notary service rejects bundles
+#     whose nested mach-os aren't signed with the same Developer ID +
+#     secure timestamp as the outer app. So we sign each one ourselves
+#     here.
+#
+#     Identity selection (in priority order):
+#       1. APPLE_SIGNING_IDENTITY env var (override)
+#       2. tauri.conf.json bundle.macOS.signingIdentity
+#       3. "-" (ad-hoc) for local dev builds
+#     For real Developer ID identities we also pass --timestamp (Apple's
+#     RFC 3161 timestamp server, required for notarization) and
+#     --options runtime (hardened runtime, required for notarization).
+#     Ad-hoc signing supports neither.
+if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+  IDENTITY="$APPLE_SIGNING_IDENTITY"
+else
+  IDENTITY=$(node -p "require('$REPO_ROOT/src-tauri/tauri.conf.json').bundle.macOS.signingIdentity || '-'" 2>/dev/null || echo "-")
+fi
+echo "→ re-signing with identity: $IDENTITY"
+
+sign_one() {
+  local target="$1"
+  if [ "$IDENTITY" = "-" ]; then
+    codesign --force --sign - "$target"
+  else
+    codesign --force --sign "$IDENTITY" --timestamp --options runtime "$target"
+  fi
+}
+
 codesign --remove-signature "$BUNDLE_DIR/i2pd" 2>/dev/null || true
 for dylib in "$LIB_DIR"/*.dylib; do
   [ -f "$dylib" ] || continue
@@ -180,9 +208,9 @@ done
 # nested signatures must be valid before the parent gets signed).
 for dylib in "$LIB_DIR"/*.dylib; do
   [ -f "$dylib" ] || continue
-  codesign --force --sign - "$dylib"
+  sign_one "$dylib"
 done
-codesign --force --sign - "$BUNDLE_DIR/i2pd"
+sign_one "$BUNDLE_DIR/i2pd"
 
 # --- Sanity check: launch i2pd --version with DYLD_PRINT_LIBRARIES off
 #     to confirm the rewrite worked locally. If this fails, the .app will

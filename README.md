@@ -32,12 +32,11 @@ auto-tap on the fully-qualified cask reference:
 brew install --cask jetp1ane/noctis-whisper/noctis-whisper
 ```
 
-Brew strips macOS's quarantine attribute on cask installs, so this
-sidesteps the "unidentified developer" Gatekeeper warning that
-direct-`.dmg` downloads currently trigger (Apple Developer ID +
-notarization is in flight; the shorter `brew install --cask
-noctis-whisper` form lands once submission to homebrew/homebrew-cask
-clears).
+Builds from v0.1.3 onward are signed with an Apple Developer ID and
+notarized by Apple's notary service, so Gatekeeper opens the app
+cleanly even on direct-`.dmg` downloads. (The shorter `brew install
+--cask noctis-whisper` form will work after submission to
+homebrew/homebrew-cask clears review.)
 
 ## Status
 
@@ -46,8 +45,8 @@ clears).
 Three rounds of external security audit closed. Audit ledger:
 
 - All Critical findings remediated, with regression tests.
-- All High findings remediated except **HIGH-7** (Apple Developer ID +
-  notarization), which is procurement-gated.
+- All High findings remediated, including **HIGH-7** (Apple Developer ID
+  + notarization) as of v0.1.3.
 - Selected Mediums remediated (M-1, M-8, M-9, M-12, M-14, M-15, M-19,
   M-20). Remaining Mediums are defense-in-depth and tracked for
   post-v1 cycles. None are exploit-grade in the current threat model.
@@ -55,8 +54,7 @@ Three rounds of external security audit closed. Audit ledger:
 Empirical confirmations from the dynamic pass (verified against the
 shipping binary, not just the source):
 
-- Frida and `lldb` attach are denied by macOS hardened-runtime policy
-  even under ad-hoc signing.
+- Frida and `lldb` attach are denied by macOS hardened-runtime policy.
 - Tampered dylibs in the bundled `i2pd-bundle/` are blocked at load
   by `dyld`'s code-directory hash check.
 - The 27-file SHA-256 manifest of the i2pd subprocess + dylibs +
@@ -64,11 +62,9 @@ shipping binary, not just the source):
 - Pre-unlock egress is zero — i2pd does not start until the user
   unlocks the vault.
 
-Distribution: ad-hoc + hardened-runtime signed, distributed via
-Homebrew Cask (which strips the macOS quarantine attribute, sidestepping
-the "unidentified developer" Gatekeeper warning). The transition to
-notarized direct-`.dmg` distribution depends on Developer ID
-procurement.
+Distribution: Apple Developer ID-signed, notarized, hardened-runtime,
+distributed via Homebrew Cask. Direct-`.dmg` downloads also pass
+Gatekeeper cleanly.
 
 ## Stack
 
@@ -196,8 +192,7 @@ brew install --cask jetp1ane/noctis-whisper/noctis-whisper
 ```
 
 (The shorter `brew install --cask noctis-whisper` form will work after
-submission to homebrew/homebrew-cask, which requires Developer ID +
-notarization first.)
+submission to homebrew/homebrew-cask clears review.)
 
 ## Security disclosure
 

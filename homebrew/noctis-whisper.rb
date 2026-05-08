@@ -9,17 +9,19 @@
 #      fully-qualified cask reference:
 #        brew install --cask <YOUR_GH_USER>/noctis-whisper/noctis-whisper
 #
-# Why this works without an Apple Developer ID: brew cask installs strip
-# the com.apple.quarantine extended attribute, so Gatekeeper never sees
-# the app and there's no "unidentified developer" warning. The hardened-
-# runtime entitlements (which block debugger/Frida attach) still apply.
+# Signed with Apple Developer ID and notarized by Apple's notary service
+# from v0.1.3 onward, so Gatekeeper opens the app cleanly with no
+# "unidentified developer" warning even on direct .dmg downloads (brew
+# also strips com.apple.quarantine). Hardened-runtime entitlements
+# remain in force — JIT, debugger attach, and DYLD_* env vars are all
+# denied at the OS level.
 
 cask "noctis-whisper" do
-  version "0.1.2"
+  version "0.1.3"
 
   # Apple Silicon-only for v0.1.0 — Intel build to follow.
   depends_on arch: :arm64
-  sha256 "bc25f734f50f04f6f1253a1709c5ce552d7ecc6d65aee83fbbbaaa08f1bf9fb8"
+  sha256 "3c3adfcc773ca683c8f86512bb6ee8bdabce5aaa3ddb079872cb25df1a430e2b"
   url "https://github.com/JetP1ane/Whisper/releases/download/v#{version}/Noctis_Whisper_#{version}_aarch64.dmg"
 
   name "Noctis Whisper"

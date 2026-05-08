@@ -1,13 +1,14 @@
 # Distributing Noctis Whisper via Homebrew Cask
 
 This is the install path for users who don't want to manually download
-DMGs. Brew Cask installs strip macOS's quarantine attribute, so users
-never see the "unidentified developer" warning even though the app is
-ad-hoc-signed (no Apple Developer ID required).
+DMGs. From v0.1.3 onward the app is signed with an Apple Developer ID
+and notarized by Apple's notary service, so Gatekeeper opens it
+cleanly on direct `.dmg` downloads as well as via brew. Brew Cask
+also strips macOS's quarantine attribute on install for good measure.
 
-The hardened-runtime entitlements still apply, so the security
+Hardened-runtime entitlements remain in force, so the security
 properties verified during the audit (Frida/lldb attach denial,
-library validation, sandbox) are unchanged.
+library validation) are unchanged.
 
 ## One-time setup
 
@@ -40,9 +41,9 @@ You need two GitHub repos:
    brew install --cask <your-gh-user>/noctis-whisper/noctis-whisper
    ```
 
-   Once you've submitted the cask to homebrew/homebrew-cask (after
-   Developer ID + notarization), the same install works without the
-   tap prefix as `brew install --cask noctis-whisper`.
+   Once the cask is accepted into homebrew/homebrew-cask, the same
+   install works without the tap prefix as
+   `brew install --cask noctis-whisper`.
 
 ## Per-release flow
 
