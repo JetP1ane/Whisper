@@ -178,4 +178,4 @@ advisory on this repo rather than a public issue.
 
 ## License
 
-TBD.
+MIT — see [`LICENSE`](LICENSE).
