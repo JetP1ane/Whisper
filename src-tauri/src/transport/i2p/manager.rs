@@ -285,6 +285,111 @@ fn pick_free_port() -> I2pResult<u16> {
     Ok(port)
 }
 
+/// Kill any orphan i2pd subprocess that's still holding a flock on
+/// `<i2p_dir>/i2pd.pid`.
+///
+/// Why this exists: brew's `cask` upgrade flow is "remove the old .app,
+/// install the new .app." It does not reach into the OS process tree to
+/// reap children. So when a user upgrades, the parent Whisper app is
+/// killed (its executable on disk is gone) but the i2pd subprocess it
+/// forked keeps running indefinitely. The new app then tries to spawn
+/// its own i2pd, which fails to acquire the data dir's pid-file lock,
+/// and the UI hangs at "Still connecting..." with no error surfaced.
+///
+/// We defend against that by reading the pid file on every start and,
+/// if the PID inside is alive AND its executable path ends in
+/// `i2pd-bundle/i2pd` (the safety check — never SIGKILL an unrelated
+/// process whose PID happens to collide), terminating it before
+/// launching the new instance. The path-suffix check matches our
+/// binary regardless of which .app it was launched from, which is
+/// exactly the orphan case (the orphan was launched from a now-removed
+/// or now-renamed .app).
+fn kill_orphan_i2pd(i2p_dir: &Path) {
+    let pid_path = i2p_dir.join("i2pd.pid");
+    let raw = match std::fs::read_to_string(&pid_path) {
+        Ok(s) => s,
+        Err(_) => return, // no pid file → nothing to clean
+    };
+    let pid: i32 = match raw.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&pid_path);
+            return;
+        }
+    };
+    if pid <= 0 {
+        let _ = std::fs::remove_file(&pid_path);
+        return;
+    }
+
+    // libc::kill(pid, 0) returns 0 if the process exists (and we have
+    // permission to signal it); ESRCH otherwise.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        // Dead. Stale pid file left from a prior crash.
+        let _ = std::fs::remove_file(&pid_path);
+        return;
+    }
+
+    if !is_our_i2pd_process(pid) {
+        // Live process at this PID but it isn't ours. PID reuse is rare
+        // but real; refuse to touch an unrelated process. Leave the
+        // pid file in place and let i2pd's own startup error out so the
+        // user sees something explicit rather than a silent kill.
+        tracing::warn!(
+            "i2p: pid file points to live PID {pid} but the executable \
+             at that PID is not our bundled i2pd; not touching it"
+        );
+        return;
+    }
+
+    tracing::info!(
+        "i2p: orphan i2pd subprocess pid={pid} still running \
+         (likely from a prior brew upgrade) — terminating before respawn"
+    );
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    // Give it ~2s to exit on SIGTERM before escalating.
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(100));
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            break;
+        }
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let _ = std::fs::remove_file(&pid_path);
+}
+
+/// On macOS, resolve a PID's executable path via libproc and check
+/// that it ends in `i2pd-bundle/i2pd`. The suffix match is what we want
+/// — the orphan was launched from an .app that's since been replaced
+/// or renamed, so the absolute path won't match the current bundle's
+/// path, but the trailing `i2pd-bundle/i2pd` is invariant across our
+/// builds (set by `scripts/bundle-i2pd.sh`).
+fn is_our_i2pd_process(pid: i32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let len = unsafe {
+            libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut _, buf.len() as u32)
+        };
+        if len <= 0 {
+            return false;
+        }
+        buf.truncate(len as usize);
+        let path = String::from_utf8_lossy(&buf);
+        path.ends_with("i2pd-bundle/i2pd")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux dev/test path: /proc/<pid>/exe is a symlink to the binary.
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        exe.map(|p| p.to_string_lossy().ends_with("i2pd-bundle/i2pd"))
+            .unwrap_or(false)
+    }
+}
+
 /// Configuration for an `I2PManager` launch.
 #[derive(Debug, Clone)]
 pub struct I2pConfig {
@@ -430,6 +535,12 @@ impl I2PManager {
             .truncate(true)
             .open(&log_path)?;
         let log_file_err = log_file.try_clone()?;
+
+        // Reap any orphan i2pd from a prior app launch (e.g. brew
+        // cask upgrade left the subprocess parentless) before spawning
+        // ours — otherwise the new spawn fails to acquire the pid-file
+        // flock and the SAM bridge never comes up.
+        kill_orphan_i2pd(&i2p_dir);
 
         tracing::info!("i2p: spawning i2pd (sam={sam_addr}, datadir={})", i2p_dir.display());
         let mut child = Command::new(&bin)
