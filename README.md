@@ -4,7 +4,7 @@ A private, post-quantum, peer-to-peer messenger for macOS.
 
 No central server, no operator-run relay. The transport is I2P, so peers
 connect directly to each other through anonymous garlic-routed tunnels.
-Cryptography is hybrid post-quantum — every session is protected by both
+Cryptography is hybrid post-quantum and every session is protected by both
 classical X25519 and ML-KEM-1024, so an attacker has to break both legs
 to recover a key. Local storage is SQLCipher anchored to a hardware-bound
 seed in the macOS Keychain (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
@@ -12,7 +12,7 @@ non-syncable). A clone of the database file on another machine cannot be
 opened without the original Mac's Keychain.
 
 For the architecture and the threat model, see
-[`WHITEPAPER.md`](WHITEPAPER.md). For the elevator-pitch version, see
+[`WHITEPAPER.md`](WHITEPAPER.md). For the high-level version, see
 [`LITEPAPER.md`](LITEPAPER.md).
 
 ## Status
