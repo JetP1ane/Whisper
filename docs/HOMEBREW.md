@@ -1,10 +1,10 @@
 # Distributing Whisper via Homebrew Cask
 
 This is the install path for users who don't want to manually download
-DMGs. From v0.1.3 onward the app is signed with an Apple Developer ID
-and notarized by Apple's notary service, so Gatekeeper opens it
-cleanly on direct `.dmg` downloads as well as via brew. Brew Cask
-also strips macOS's quarantine attribute on install for good measure.
+DMGs. Every release is signed with an Apple Developer ID and notarized
+by Apple's notary service, so Gatekeeper opens it cleanly on direct
+`.dmg` downloads as well as via brew. Brew Cask also strips macOS's
+quarantine attribute on install for good measure.
 
 Hardened-runtime entitlements remain in force, so the security
 properties verified during the audit (Frida/lldb attach denial,
