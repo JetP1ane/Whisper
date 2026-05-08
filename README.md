@@ -36,10 +36,10 @@ auto-tap on the fully-qualified cask reference:
 brew install --cask jetp1ane/noctis-whisper/noctis-whisper
 ```
 
-Builds from v0.1.3 onward are signed with an Apple Developer ID and
-notarized by Apple's notary service, so Gatekeeper opens the app
-cleanly even on direct-`.dmg` downloads. (The shorter `brew install
---cask noctis-whisper` form will work after submission to
+Every release is signed with an Apple Developer ID and notarized by
+Apple's notary service, so Gatekeeper opens the app cleanly even on
+direct `.dmg` downloads. (The shorter `brew install --cask
+noctis-whisper` form will work after submission to
 homebrew/homebrew-cask clears review.)
 
 ## Status
