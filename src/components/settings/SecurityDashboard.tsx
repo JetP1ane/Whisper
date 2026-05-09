@@ -293,10 +293,16 @@ function RecoveryPhraseRow() {
       <h3 className="text-[10px] font-mono uppercase tracking-wider text-text-tertiary mb-2">
         Recovery phrase
       </h3>
-      <p className="text-xs text-text-secondary leading-relaxed mb-3">
-        12 words that can re-derive your Whisper ID and identity keys on a new
-        device. Anyone with these words can take over your account — store them
-        offline.
+      <p className="text-xs text-text-secondary leading-relaxed mb-2">
+        12 words that can rebuild your Whisper ID on a new device if you ever
+        lose this Mac. Anyone with these words can take over your account —
+        store them offline.
+      </p>
+      <p className="text-[11px] text-status-err leading-snug mb-3">
+        Use these only to <em>move</em> to a new device, not to run Whisper on
+        two at once. Whisper isn't a multi-device app — each install registers
+        separately on the network, so contacts you've already added will only
+        reach the copy they paired with.
       </p>
 
       {phrase ? (
@@ -364,6 +370,10 @@ function RecoveryPhraseDisplay({ phrase, onHide }: { phrase: string; onHide: () 
           </div>
         ))}
       </div>
+      <p className="text-[11px] text-status-err leading-snug">
+        Reminder: don't enter these on another device while this one is still
+        in use. Whisper isn't a multi-device app.
+      </p>
       <div className="flex gap-2">
         <button
           onClick={async () => {

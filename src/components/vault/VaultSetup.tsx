@@ -161,6 +161,12 @@ function ShowRecoveryPhrase({
           don't email, don't store online — pen and paper, or a hardware
           password manager.
         </p>
+        <p className="text-[11px] text-status-err mt-2 leading-snug">
+          Use these only to <em>move</em> Whisper to a new device, not to run
+          it on a second device alongside this one. Whisper isn't a
+          multi-device app — each install registers separately on the
+          network, and contacts will only reach the copy they paired with.
+        </p>
 
         <div className="mt-5 grid grid-cols-3 gap-2 px-2 py-3 rounded-md bg-bg-inset border border-border-subtle">
           {words.map((w, i) => (
