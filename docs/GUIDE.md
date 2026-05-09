@@ -1,4 +1,4 @@
-# Whisper — User Guide
+# Whisper User Guide
 
 This is the operational guide. Read it for *how to use* Whisper. For
 the architecture and the threat model, see
@@ -28,13 +28,13 @@ steps, in order.
 ### 1. Choose a vault passphrase
 
 Your passphrase encrypts the local database. It is **not** recoverable
-— if you forget it, the only way back into your account is the
+- if you forget it, the only way back into your account is the
 recovery phrase from step 3, which wipes the local message history
 and rebuilds your identity from scratch.
 
 Pick something long. Whisper runs Argon2id with ~256 MiB of memory
 and 4 iterations against the passphrase, so even a relatively simple
-phrase is computationally expensive to brute-force — but a *short*
+phrase is computationally expensive to brute-force - but a *short*
 passphrase is short regardless of how slow the derivation is. A
 sentence you'd remember anyway is a good starting point.
 
@@ -81,7 +81,7 @@ To add Bob:
 
 1. Bob taps the `+` next to **Direct Messages** in his app and copies
    the `whisper://...` link Whisper generates.
-2. Bob shares the link with you over a channel you trust — text
+2. Bob shares the link with you over a channel you trust - text
    message, encrypted email, in person, QR code.
 3. You paste the link into your `+` dialog. Whisper verifies the
    bundle's signature, derives Bob's alias from his identity key, and
@@ -96,7 +96,7 @@ After both sides have added each other, messages flow.
 Each whisper:// link contains a one-time prekey (OTPK). The first
 person to use the link to complete the handshake consumes the OTPK.
 If you share the same link with a second person, they will appear to
-add you successfully but their messages will never arrive — Whisper
+add you successfully but their messages will never arrive - Whisper
 on your side has no OTPK left to complete their bootstrap.
 
 **Mint a fresh link for each person.** This is intentional and
@@ -118,7 +118,7 @@ imported:
 These prevent forgery but they cannot prevent a man-in-the-middle on
 the channel that delivered the link. If an attacker substituted Bob's
 link with one of their own, Whisper would happily import the
-attacker's bundle as a *correctly signed identity* — just not Bob's.
+attacker's bundle as a *correctly signed identity* - just not Bob's.
 
 For that case, use **safety numbers**. Open the contact's info panel,
 tap **Verification**, and read the 60-digit fingerprint aloud over a
@@ -126,8 +126,8 @@ phone call you trust, or compare in person. If both sides see the
 same safety number, the keys you each hold are unmodified. Mark the
 contact as verified once you've confirmed.
 
-You can chat with an unverified contact — Whisper will not block
-that — but anything sensitive should wait until verification.
+You can chat with an unverified contact - Whisper will not block
+that - but anything sensitive should wait until verification.
 
 ---
 
@@ -141,7 +141,7 @@ Type, hit Enter. The message bubble shows one of:
 |---|---|
 | (no badge) | Sending |
 | Single check | Delivered to the recipient's device |
-| (red banner) | Delivery failed — Whisper will retry on a backoff for up to 30 days |
+| (red banner) | Delivery failed - Whisper will retry on a backoff for up to 30 days |
 
 The retry queue is persistent and survives app restarts and reboots.
 If your contact comes back online a week from now, queued messages
@@ -168,7 +168,7 @@ Two consequences worth understanding:
    pairwise channels.
 
 If membership churn is expected under adversarial conditions, rooms
-are the wrong tool — use direct messages.
+are the wrong tool - use direct messages.
 
 ---
 
@@ -201,7 +201,7 @@ connecting"](#app-stuck-on-still-connecting) under troubleshooting.
 - You want to use Whisper on both your laptop and desktop at once.
   This isn't supported. Each install registers a different network
   address even with the same recovery phrase, so contacts will only
-  reach the device they originally paired with — and if both devices
+  reach the device they originally paired with - and if both devices
   send messages to the same contact, their decryption chain will
   desync.
 
@@ -231,7 +231,7 @@ Confirm the destructive-wipe gate. The app rebuilds your identity from
 the seed.
 
 Existing contacts who safety-number-verified your old keypair will see
-the same safety number on the new device — the keys are the same. But
+the same safety number on the new device - the keys are the same. But
 they have no automatic notification that you moved, so you'll want to
 tell them out-of-band.
 
@@ -317,7 +317,7 @@ authorization to read keychain items the previous binary created.
 
 This shouldn't recur on routine upgrades, since v1.0.x and beyond all
 ship under the same stable Developer ID. If you see it on every
-launch, that's a regression — please file an issue.
+launch, that's a regression - please file an issue.
 
 ### Touch ID prompts on operations that didn't used to need it
 
@@ -328,7 +328,7 @@ Whisper session, it cannot trigger those operations without a
 user-visible prompt the user can refuse.
 
 If macOS isn't offering Touch ID on a Mac that has it, fall back to
-your account password — Whisper accepts either.
+your account password - Whisper accepts either.
 
 ---
 
@@ -352,11 +352,11 @@ holds up. A short list:
 - **Trust your hardware.** The hardware-anchored Keychain seed is
   what makes a stolen disk image insufficient to decrypt your vault.
   If you suspect the original device is compromised, the keys are
-  effectively in the attacker's hands once macOS is unlocked — at
+  effectively in the attacker's hands once macOS is unlocked - at
   that point, abandon the identity and re-mint from a fresh phrase.
 
-For the full threat-model breakdown — what's strong, what's
-best-effort, what's explicitly out of scope — see
+For the full threat-model breakdown - what's strong, what's
+best-effort, what's explicitly out of scope - see
 [`WHITEPAPER.md`](../WHITEPAPER.md).
 
 ---
