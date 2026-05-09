@@ -19,6 +19,8 @@ seed in the macOS Keychain (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`,
 non-syncable). A clone of the database file on another machine cannot be
 opened without the original Mac's Keychain.
 
+For day-to-day usage — adding contacts, what status indicators mean,
+moving devices, troubleshooting — see [`docs/GUIDE.md`](docs/GUIDE.md).
 For the architecture and the threat model, see
 [`WHITEPAPER.md`](WHITEPAPER.md). For the high-level version, see
 [`LITEPAPER.md`](LITEPAPER.md).
