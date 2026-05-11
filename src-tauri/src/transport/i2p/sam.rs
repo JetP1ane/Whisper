@@ -507,45 +507,6 @@ pub async fn stream_accept(
     Ok((buf.into_inner(), peer_dest, leftover))
 }
 
-/// SAM v3.2+ `PING <token>` / `PONG <token>` keepalive.
-///
-/// Used by the session keepalive task to keep the master control
-/// socket from idling out — without periodic activity, i2pd
-/// (or NAT/OS-level idle TCP cleanup) will eventually close the
-/// control socket, which i2pd interprets as session termination.
-/// All subsequent `STREAM ACCEPT` / `STREAM CONNECT` calls then
-/// reference a dead session id and fail. The symptom is "messages
-/// stop arriving after an hour or so of idle; restart fixes it."
-///
-/// Sends one `PING <token>` line on the existing control connection
-/// and waits for a matching `PONG <token>` reply. Returns `Ok(())`
-/// on a successful round-trip. The caller is responsible for the
-/// retry/abort policy.
-pub async fn ping<RW>(rw: &mut BufReader<RW>) -> I2pResult<()>
-where
-    RW: AsyncRead + AsyncWrite + Unpin,
-{
-    // Random per-call token so we can verify we got the right PONG
-    // back (not just any line that happened to be in the buffer).
-    let token = format!("kp{}", uuid::Uuid::new_v4().simple());
-    let cmd = format!("PING {token}");
-    send_line(rw.get_mut(), &cmd).await?;
-    let mut line = String::new();
-    let n = rw.read_line(&mut line).await?;
-    if n == 0 {
-        return Err(I2pError::Disconnected);
-    }
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    let expected = format!("PONG {token}");
-    if trimmed == expected {
-        Ok(())
-    } else {
-        Err(I2pError::Sam(format!(
-            "PING returned unexpected response: `{trimmed}`"
-        )))
-    }
-}
-
 /// `NAMING LOOKUP` — resolve a short name (e.g. `whisper.alice.i2p`) to a
 /// full destination via i2pd's local address book. Stateless one-shot,
 /// same socket pattern as [`dest_generate_oneshot`]. We don't *use* this

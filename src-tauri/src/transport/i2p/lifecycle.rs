@@ -243,46 +243,6 @@ pub async fn finalize(
         }
     });
 
-    // Session keepalive: every ~3 min (with jitter) issue a SAM
-    // PING/PONG on the master control socket. Without this, the socket
-    // sits idle and i2pd (or the OS network stack) closes it after
-    // prolonged inactivity, which terminates the master session and
-    // breaks both inbound and outbound traffic until the user
-    // relocks/unlocks. The jitter prevents a deterministic-fingerprint
-    // beacon at a fixed cadence.
-    let keepalive_manager = manager.clone();
-    let keepalive_worker = tokio::spawn(async move {
-        use rand::Rng;
-        // Random initial delay so multiple Whisper instances on the
-        // same network don't all PING in unison.
-        let initial = rand::thread_rng().gen_range(30..=60);
-        tokio::time::sleep(std::time::Duration::from_secs(initial)).await;
-        loop {
-            match keepalive_manager.keepalive_tick().await {
-                Ok(()) => {
-                    tracing::debug!("i2p: session keepalive PING/PONG ok");
-                }
-                Err(e) => {
-                    // Log loudly. We don't auto-recover for now — the
-                    // user can lock+unlock to rebuild the session, and
-                    // shipping that loop is a bigger change worth its
-                    // own review.
-                    tracing::warn!(
-                        "i2p: session keepalive PING failed: {e} \
-                         — master session may be unhealthy; \
-                         a vault lock+unlock will rebuild it"
-                    );
-                }
-            }
-            // 180s ± 25% — well under any plausible idle timeout (SAM
-            // bridges typically allow 5+ min, NAT idle is usually 5-15
-            // min, App Nap may suspend for longer but the PING resets
-            // the kernel's idle counter on resume).
-            let jitter = rand::thread_rng().gen_range(135..=225);
-            tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
-        }
-    });
-
     // M-19: every long-lived task that captures an `Arc<I2PManager>`
     // (and through it a live SQLCipher Database connection) must be
     // registered with the runtime so vault_lock can abort it before
@@ -291,7 +251,7 @@ pub async fn finalize(
     Ok(I2PRuntime::from_parts(
         manager,
         connection,
-        vec![queue_worker, prewarm_worker, room_drain_worker, keepalive_worker],
+        vec![queue_worker, prewarm_worker, room_drain_worker],
     ))
 }
 

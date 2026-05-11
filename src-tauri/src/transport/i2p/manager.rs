@@ -489,7 +489,8 @@ impl PreStartedI2pd {
 
     /// The `I2pSource` this pre-warm was started against. Compared by
     /// the unlock path against the user's current persisted preference
-    /// to detect mid-launch setting changes.
+    /// to detect mid-launch setting changes (e.g. user toggled
+    /// external mode while the vault was still locked).
     pub fn source(&self) -> &I2pSource {
         &self.source
     }
@@ -529,14 +530,7 @@ pub struct I2PManager {
     /// Long-lived control socket holding the master session open. Closing
     /// this tears down the session in i2pd, so it stays in the manager's
     /// owned state for its full lifetime.
-    ///
-    /// Wrapped in `tokio::sync::Mutex` so the session-keepalive task
-    /// (spawned from `lifecycle::finalize`) can periodically issue SAM
-    /// PINGs against it. Without that activity, i2pd or the OS network
-    /// stack will close the socket after extended idleness — the user-
-    /// visible symptom was "messages stop arriving after about an hour
-    /// of idle, restart fixes it."
-    _control: tokio::sync::Mutex<BufReader<TcpStream>>,
+    _control: BufReader<TcpStream>,
     /// Our persisted destination (pub + priv, base64).
     destination: PersistedDestination,
     /// Owned secondary DB connection for the queue worker (Phase 6.5).
@@ -738,8 +732,8 @@ impl I2PManager {
             child,
             log_path,
             sam_addr,
-            // The source is informational on the pre-warm only; the
-            // manager identifies its router by `sam_addr` + Option<Child>.
+            // Informational on the pre-warm only — the manager identifies
+            // its router by `sam_addr` + `Option<Child>`, not by source.
             source: _,
         } = pre;
 
@@ -778,7 +772,7 @@ impl I2PManager {
             log_path,
             sam_addr,
             session_id,
-            _control: tokio::sync::Mutex::new(control),
+            _control: control,
             destination,
             db,
         })
@@ -832,28 +826,16 @@ impl I2PManager {
         &self.db
     }
 
-    /// Issue a SAM PING/PONG round-trip on the master control socket.
-    /// Driven by the session-keepalive task spawned in
-    /// `lifecycle::finalize` every ~3 minutes (with jitter). Without
-    /// this, i2pd silently terminates the master session after
-    /// prolonged idle and all `STREAM ACCEPT` / `STREAM CONNECT`
-    /// calls start failing against a dead session id.
-    pub async fn keepalive_tick(&self) -> I2pResult<()> {
-        let mut guard = self._control.lock().await;
-        sam::ping(&mut *guard).await
-    }
-
     /// Graceful shutdown: drop the control socket (kills the session in
     /// i2pd) then SIGTERM the process. SIGKILL after 5s if it lingers.
     /// In External mode, only the control socket is torn down — we
     /// never signal a process we don't own.
     pub async fn shutdown(mut self) -> I2pResult<()> {
-        // Closing the control socket tears down the session. We own
-        // `self`, so `Mutex::get_mut` lets us reach the inner BufReader
-        // without locking (no other references can exist at this
-        // point). The keepalive task that shares the Mutex was
-        // aborted by `I2PRuntime::shutdown` before this method runs.
-        if let Ok(()) = self._control.get_mut().get_mut().shutdown().await {
+        // Closing the control socket tears down the session.
+        // Take ownership of the BufReader's inner stream so we can call
+        // shutdown explicitly — this signals EOF to i2pd faster than a
+        // `drop` alone.
+        if let Ok(()) = self._control.get_mut().shutdown().await {
             tracing::debug!("i2p: control socket shut down");
         }
 
