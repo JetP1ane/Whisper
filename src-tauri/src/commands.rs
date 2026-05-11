@@ -800,13 +800,19 @@ fn spawn_i2p_start(
                     .await
                 }
                 None => {
+                    let source = crate::transport::i2p::runtime::read_persisted_source(
+                        &profile_dir,
+                    );
                     tracing::info!(
-                        "i2p: no pre-warm available — running full cold start (attempt={attempt})"
+                        "i2p: no pre-warm available — running full cold start \
+                         (attempt={attempt}, source={})",
+                        if source.is_bundled() { "bundled" } else { "external" }
                     );
                     crate::transport::i2p::lifecycle::start(
                         db,
                         profile_dir.clone(),
                         enable_transit,
+                        source,
                         dispatcher,
                         on_queued_delivered,
                     )
@@ -3121,6 +3127,101 @@ pub async fn i2p_get_transit_optin(
         .unwrap_or(false))
 }
 
+/// Read the persisted i2p-source preference. Defaults to `Bundled`.
+/// Vault-lock-state independent: the preference lives in a plaintext
+/// JSON in the profile dir so the pre-warm path (which runs before
+/// the vault is unlocked) can read it too.
+#[tauri::command]
+pub async fn i2p_get_source() -> CmdResult<crate::transport::i2p::manager::I2pSource> {
+    let profile_dir = crate::profile::data_dir();
+    Ok(crate::transport::i2p::runtime::read_persisted_source(&profile_dir))
+}
+
+/// Persist a new i2p-source preference. Takes effect on the next vault
+/// unlock — i2pd needs to be re-spawned (or, in External mode, the
+/// SAM connection needs to be re-established against a different
+/// endpoint). The UI tells the user a restart is required.
+///
+/// Always runs a `test_source` probe first so a user can't lock
+/// themselves into an unreachable configuration. The probe runs with a
+/// 5s timeout for external (long enough for a healthy local router,
+/// short enough to fail fast on a typo'd host); Bundled mode skips the
+/// probe — its readiness check happens at spawn time on next unlock.
+#[tauri::command]
+pub async fn i2p_set_source(
+    source: crate::transport::i2p::manager::I2pSource,
+) -> CmdResult<()> {
+    use crate::transport::i2p::manager::I2pSource;
+
+    if let I2pSource::External { host, port } = &source {
+        probe_external_sam(host, *port, std::time::Duration::from_secs(5))
+            .await
+            .map_err(|e| {
+                format!(
+                    "cannot reach external SAM bridge at {host}:{port}: {e} \
+                     — settings not saved"
+                )
+            })?;
+    }
+
+    let profile_dir = crate::profile::data_dir();
+    crate::transport::i2p::runtime::write_persisted_source(&profile_dir, &source)
+        .map_err(|e| format!("failed to persist i2p source preference: {e}"))?;
+    tracing::info!(
+        "i2p: source preference saved ({}) — effective on next vault unlock",
+        match &source {
+            I2pSource::Bundled => "bundled".to_string(),
+            I2pSource::External { host, port } => format!("external {host}:{port}"),
+        }
+    );
+    Ok(())
+}
+
+/// Test whether a given i2p source is reachable WITHOUT persisting it.
+/// Drives the "Test connection" button in Settings → Security.
+/// Bundled mode: verifies the bundled binary exists and passes the
+/// integrity pin (the same checks `pre_start` does, minus the actual
+/// spawn). External mode: opens a SAM HELLO with a 5s timeout.
+#[tauri::command]
+pub async fn i2p_test_source(
+    source: crate::transport::i2p::manager::I2pSource,
+) -> CmdResult<()> {
+    use crate::transport::i2p::manager::I2pSource;
+    match source {
+        I2pSource::Bundled => {
+            // We can verify the binary exists + the SHA-256 manifest
+            // matches. We don't try to spawn it here — that would be
+            // 10-30s of wait for a no-op test button.
+            crate::transport::i2p::manager::verify_bundled_for_test()
+                .map_err(|e| format!("bundled i2pd integrity check failed: {e}"))?;
+            Ok(())
+        }
+        I2pSource::External { host, port } => {
+            probe_external_sam(&host, port, std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| format!("SAM probe at {host}:{port} failed: {e}"))
+        }
+    }
+}
+
+/// Connect to a SAM v3 bridge and run HELLO. Internal helper for the
+/// set/test commands; bounded by `timeout` so a typo'd host can't hang
+/// the UI for the full TCP connect backoff.
+async fn probe_external_sam(
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let addr = format!("{host}:{port}");
+    tokio::time::timeout(
+        timeout,
+        crate::transport::i2p::manager::sam_hello_probe(&addr),
+    )
+    .await
+    .map_err(|_| format!("timed out after {}s", timeout.as_secs()))?
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn i2p_status(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult<I2pStatus> {
     let runtime = {
@@ -3136,7 +3237,11 @@ pub async fn i2p_status(state: State<'_, std::sync::Arc<AppState>>) -> CmdResult
                 destination: rt.manager.destination_pub().to_string(),
                 session_id: rt.manager.session_id().to_string(),
                 sam_addr: rt.manager.sam_addr().to_string(),
-                log_path: rt.manager.log_path().to_string_lossy().into_owned(),
+                log_path: rt
+                    .manager
+                    .log_path()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 cached_outbound_streams,
                 bootstrap_attempt: bs.attempt,
                 bootstrap_last_error: bs.last_error,

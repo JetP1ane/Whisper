@@ -113,3 +113,22 @@ export async function setContactVerified(
   await invoke("contact_verify", { id: contactId, verified });
 }
 
+// ---------------------------------------------------------------------------
+// I2P router source: choose between the bundled, integrity-pinned i2pd that
+// ships with Whisper and an external router the user runs themselves.
+
+export type I2pSource =
+  | { kind: "bundled" }
+  | { kind: "external"; host: string; port: number };
+
+export async function i2pGetSource(): Promise<I2pSource> {
+  return invoke<I2pSource>("i2p_get_source");
+}
+
+export async function i2pSetSource(source: I2pSource): Promise<void> {
+  await invoke("i2p_set_source", { source });
+}
+
+export async function i2pTestSource(source: I2pSource): Promise<void> {
+  await invoke("i2p_test_source", { source });
+}

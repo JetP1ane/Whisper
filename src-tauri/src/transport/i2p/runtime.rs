@@ -131,12 +131,51 @@ impl I2PRuntime {
     }
 }
 
-/// Convenience: build the standard `I2pConfig` from a profile dir + a
-/// transit-opt-in flag. Wraps the otherwise-trivial struct so callers
-/// don't need to import the manager type.
-pub fn config_for(profile_dir: std::path::PathBuf, enable_transit: bool) -> I2pConfig {
+/// Convenience: build the standard `I2pConfig` from a profile dir, a
+/// transit-opt-in flag, and the user's chosen i2pd source (Bundled or
+/// External). Wraps the otherwise-trivial struct so callers don't need
+/// to import the manager type.
+pub fn config_for(
+    profile_dir: std::path::PathBuf,
+    enable_transit: bool,
+    source: super::manager::I2pSource,
+) -> I2pConfig {
     I2pConfig {
         profile_dir,
         enable_transit,
+        source,
     }
+}
+
+/// Filename for the on-disk i2p-source preference within a profile dir.
+/// Plaintext JSON. The setting is not sensitive (it's a transport
+/// preference, not a key), and the pre-warm runs before the vault is
+/// unlocked so an encrypted store wouldn't be readable at that point.
+const I2P_SOURCE_FILE: &str = "i2p_source.json";
+
+/// Read the persisted i2p source from `<profile_dir>/i2p_source.json`.
+/// Returns `Bundled` if the file is missing or unparseable — Bundled
+/// is the safe, default-trust path.
+pub fn read_persisted_source(
+    profile_dir: &std::path::Path,
+) -> super::manager::I2pSource {
+    let path = profile_dir.join(I2P_SOURCE_FILE);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Write the i2p source preference to `<profile_dir>/i2p_source.json`.
+/// Used by the `i2p_set_source` Tauri command. Bubbles up filesystem
+/// errors so the UI can surface a "couldn't save" state instead of
+/// silently dropping the change.
+pub fn write_persisted_source(
+    profile_dir: &std::path::Path,
+    source: &super::manager::I2pSource,
+) -> std::io::Result<()> {
+    let path = profile_dir.join(I2P_SOURCE_FILE);
+    let json = serde_json::to_string_pretty(source)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(&path, json)
 }

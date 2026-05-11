@@ -64,6 +64,9 @@ pub fn run() {
             commands::i2p_status,
             commands::i2p_get_transit_optin,
             commands::i2p_set_transit_optin,
+            commands::i2p_get_source,
+            commands::i2p_set_source,
+            commands::i2p_test_source,
             commands::messages_search,
             commands::notifications_get,
             commands::notifications_set,
@@ -160,10 +163,23 @@ pub fn run() {
             let handle = tauri::async_runtime::spawn(async move {
                 let profile_dir = profile::data_dir();
                 let enable_transit = false; // mirrors the unlock-path default
-                tracing::info!("i2p: starting pre-warm (phase A)");
+                // Honor the user's persisted i2pd-source preference (Bundled
+                // by default; External when they've explicitly opted in via
+                // Settings → Security). Pre-warm before vault unlock, so we
+                // can't read the SQLCipher settings table — the preference
+                // lives in a plaintext JSON in the profile dir specifically
+                // so this pre-warm path can resolve it.
+                let source = crate::transport::i2p::runtime::read_persisted_source(
+                    &profile_dir,
+                );
+                tracing::info!(
+                    "i2p: starting pre-warm (phase A, source={})",
+                    if source.is_bundled() { "bundled" } else { "external" }
+                );
                 match crate::transport::i2p::lifecycle::pre_start(
                     profile_dir,
                     enable_transit,
+                    source,
                 )
                 .await
                 {

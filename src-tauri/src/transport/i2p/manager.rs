@@ -398,8 +398,56 @@ pub struct I2pConfig {
     pub profile_dir: PathBuf,
     /// Whether to enable transit routing (forward encrypted traffic for
     /// other I2P users). Default `false` per Mod #1; Phase 10 onboarding
-    /// flips this to true after the user opts in.
+    /// flips this to true after the user opts in. Only honored when
+    /// `source` is `Bundled` — external routers are configured by the
+    /// user, not by Whisper.
     pub enable_transit: bool,
+    /// Where the i2pd SAM bridge that Whisper talks to lives. Defaults
+    /// to `Bundled`, which spawns the integrity-pinned i2pd we ship
+    /// inside `.app/Contents/Resources/i2pd-bundle/`. `External` skips
+    /// the spawn entirely and connects to a SAM endpoint the user
+    /// supplies.
+    pub source: I2pSource,
+}
+
+/// Selects whether Whisper spawns its own bundled i2pd or connects to
+/// a user-supplied SAM bridge.
+///
+/// **Trust framing.** In `Bundled` mode, Whisper owns the entire
+/// transport-layer trust boundary: the i2pd binary is SHA-256 pinned
+/// (mismatches refuse to start), every nested dylib is signed with our
+/// Developer ID, and the subprocess runs under Hardened Runtime. In
+/// `External` mode the user is substituting their own router: Whisper
+/// can only vouch for the SAM messages it sends and receives over the
+/// loopback (or remote) socket, not for the router's binary, config,
+/// peer selection, NetDB state, or anything else below the SAM bridge.
+/// The UI surfaces this distinction explicitly when External is
+/// enabled.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum I2pSource {
+    /// Spawn the bundled, integrity-pinned i2pd subprocess on a
+    /// randomized loopback SAM port. Default.
+    Bundled,
+    /// Connect to a user-supplied SAM bridge. Host is typically
+    /// `127.0.0.1` (the user's own router on the same machine) but can
+    /// be any host the user can reach — Whisper does not constrain it
+    /// beyond the warnings in the UI. Port is the SAM v3 listener port
+    /// (i2pd default is 7656; Java I2P default is also 7656).
+    External { host: String, port: u16 },
+}
+
+impl Default for I2pSource {
+    fn default() -> Self {
+        Self::Bundled
+    }
+}
+
+impl I2pSource {
+    /// Returns true for `Bundled`.
+    pub fn is_bundled(&self) -> bool {
+        matches!(self, Self::Bundled)
+    }
 }
 
 /// Phase-A pre-start state: i2pd subprocess up, SAM bridge ready, NetDB
@@ -415,9 +463,15 @@ pub struct I2pConfig {
 ///
 /// `kill_on_drop` semantics on `child`: if the user closes the app
 /// before unlocking, this struct is dropped and i2pd is reaped.
+#[derive(Debug)]
 pub struct PreStartedI2pd {
-    pub(crate) child: Child,
-    pub(crate) log_path: PathBuf,
+    /// `Some` in Bundled mode (the subprocess we spawned); `None` in
+    /// External mode (we don't own the router's process).
+    pub(crate) child: Option<Child>,
+    /// `Some` in Bundled mode (we redirect i2pd stdout/stderr here);
+    /// `None` in External mode (i2pd's own logs live wherever the
+    /// user's router writes them).
+    pub(crate) log_path: Option<PathBuf>,
     pub(crate) sam_addr: String,
 }
 
@@ -429,24 +483,31 @@ impl PreStartedI2pd {
 
     /// Take ownership and kill the subprocess. Use this on app shutdown
     /// when the vault was never unlocked, so we don't leak an orphan.
+    /// No-op in External mode.
     pub async fn shutdown(mut self) {
-        if let Some(pid) = self.child.id() {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Some(pid) = child.id() {
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
-        let _ = self.child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+        let _ = child.kill().await;
     }
 }
 
 /// Active i2pd subprocess + the master STREAM session that all Whisper
 /// inbound/outbound streams ride on top of.
 pub struct I2PManager {
-    /// The subprocess we spawned. Kept so the destructor can reap it.
-    child: Child,
-    /// Where the subprocess writes its log file (for debugging).
-    log_path: PathBuf,
+    /// The subprocess we spawned. `Some` in Bundled mode (kept so the
+    /// destructor can reap it); `None` in External mode (the router
+    /// is the user's, not ours to manage).
+    child: Option<Child>,
+    /// Where the subprocess writes its log file (Bundled mode only).
+    /// `None` in External mode.
+    log_path: Option<PathBuf>,
     /// `127.0.0.1:<random>` — the SAM bridge address every Whisper SAM
     /// call uses.
     sam_addr: String,
@@ -488,7 +549,53 @@ impl I2PManager {
     /// after vault unlock to mint the destination and create the
     /// master STREAM session. If the user closes the app without
     /// unlocking, drop the `PreStartedI2pd` (kill_on_drop reaps i2pd).
+    ///
+    /// In [`I2pSource::External`] mode this method skips the spawn,
+    /// the integrity pin, and the datadir setup entirely — it just
+    /// probes the user-supplied SAM endpoint to fail fast if the
+    /// external router is unreachable.
     pub async fn pre_start(cfg: I2pConfig) -> I2pResult<PreStartedI2pd> {
+        match cfg.source.clone() {
+            I2pSource::Bundled => Self::pre_start_bundled(cfg).await,
+            I2pSource::External { host, port } => {
+                Self::pre_start_external(host, port).await
+            }
+        }
+    }
+
+    /// External-router pre-start: connect to the user-supplied SAM
+    /// bridge, probe HELLO with a short deadline, and return. No
+    /// integrity check (we can't pin a binary we don't ship), no
+    /// subprocess to manage, no cert copy. If the bridge isn't ready
+    /// in 15s, fail with an actionable error.
+    async fn pre_start_external(host: String, port: u16) -> I2pResult<PreStartedI2pd> {
+        let sam_addr = format!("{host}:{port}");
+        tracing::info!("i2p: using external SAM bridge at {sam_addr}");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if probe_sam(&sam_addr).await.is_ok() {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err(I2pError::Subprocess(format!(
+                    "external SAM bridge at {sam_addr} did not respond to HELLO \
+                     within 15s — is your i2pd running and is SAM enabled?"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        tracing::info!("i2p: external SAM bridge ready at {sam_addr}");
+        Ok(PreStartedI2pd {
+            child: None,
+            log_path: None,
+            sam_addr,
+        })
+    }
+
+    /// Bundled-router pre-start: locate + integrity-pin our binary,
+    /// prepare the datadir, write i2pd.conf, reap any orphan, then
+    /// spawn i2pd and wait for SAM. The original `pre_start` body.
+    async fn pre_start_bundled(cfg: I2pConfig) -> I2pResult<PreStartedI2pd> {
         let bin = locate_i2pd_binary()?;
         verify_i2pd_pin(&bin)?;
         tracing::info!("i2p: using binary {}", bin.display());
@@ -591,8 +698,8 @@ impl I2PManager {
         tracing::info!("i2p: SAM ready at {sam_addr} (pre-start complete)");
 
         Ok(PreStartedI2pd {
-            child,
-            log_path,
+            child: Some(child),
+            log_path: Some(log_path),
             sam_addr,
         })
     }
@@ -678,18 +785,19 @@ impl I2PManager {
         &self.session_id
     }
 
-    /// Path to the i2pd log file (per-profile). Surfaced in the security
-    /// dashboard for diagnostics (Phase 11).
-    pub fn log_path(&self) -> &Path {
-        &self.log_path
+    /// Path to the i2pd log file (per-profile). Bundled mode only —
+    /// returns `None` when connected to an external router whose logs
+    /// live wherever the user's router writes them.
+    pub fn log_path(&self) -> Option<&Path> {
+        self.log_path.as_deref()
     }
 
-    /// PID of the i2pd subprocess we spawned, if it's alive. The egress
-    /// audit reads this so it can enumerate i2pd's sockets in a separate
-    /// pane (i2pd legitimately has many remote peers — they're shown
-    /// for transparency, not flagged as anomalies).
+    /// PID of the i2pd subprocess we spawned, if any. Bundled mode
+    /// only — returns `None` in External mode (we don't own the
+    /// router's process). The egress audit uses this to enumerate
+    /// i2pd's sockets separately.
     pub fn child_pid(&self) -> Option<u32> {
-        self.child.id()
+        self.child.as_ref().and_then(|c| c.id())
     }
 
     /// Borrow the secondary DB Mutex. Used by the queue worker so it
@@ -701,6 +809,8 @@ impl I2PManager {
 
     /// Graceful shutdown: drop the control socket (kills the session in
     /// i2pd) then SIGTERM the process. SIGKILL after 5s if it lingers.
+    /// In External mode, only the control socket is torn down — we
+    /// never signal a process we don't own.
     pub async fn shutdown(mut self) -> I2pResult<()> {
         // Closing the control socket tears down the session.
         // Take ownership of the BufReader's inner stream so we can call
@@ -710,24 +820,49 @@ impl I2PManager {
             tracing::debug!("i2p: control socket shut down");
         }
 
-        // Try graceful exit first.
-        if let Some(pid) = self.child.id() {
+        // External-router mode: we don't own the router, so we don't
+        // try to signal it. Closing the control socket above is the
+        // only cleanup we should do.
+        let Some(mut child) = self.child.take() else {
+            tracing::debug!("i2p: external router — leaving it running on shutdown");
+            return Ok(());
+        };
+
+        // Bundled: try graceful exit first.
+        if let Some(pid) = child.id() {
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
         }
-        let timeout = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+        let timeout = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
         match timeout {
             Ok(Ok(status)) => {
                 tracing::info!("i2p: i2pd exited cleanly ({status:?})");
             }
             _ => {
                 tracing::warn!("i2p: i2pd did not exit in 5s, sending SIGKILL");
-                let _ = self.child.kill().await;
+                let _ = child.kill().await;
             }
         }
         Ok(())
     }
+}
+
+/// Public SAM HELLO probe — used by `i2p_test_source` to validate an
+/// external endpoint without persisting anything. Same semantics as
+/// the internal readiness probe.
+pub async fn sam_hello_probe(addr: &str) -> I2pResult<()> {
+    probe_sam(addr).await
+}
+
+/// Public wrapper around `locate_i2pd_binary` + `verify_i2pd_pin`,
+/// surfaced so the `i2p_test_source` command can check the bundled
+/// router's integrity without paying the cost of spawning it. Fails
+/// if the binary is missing or its SHA-256 manifest doesn't match.
+pub fn verify_bundled_for_test() -> I2pResult<()> {
+    let bin = locate_i2pd_binary()?;
+    verify_i2pd_pin(&bin)?;
+    Ok(())
 }
 
 /// One-line probe of the SAM bridge: connect + HELLO, drop. Used by the
@@ -992,5 +1127,81 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// Smoke test for [`I2pSource::External`]: when set against a SAM
+    /// bridge that responds, `pre_start` should succeed and return a
+    /// `PreStartedI2pd` whose `child` is `None` (we didn't spawn one)
+    /// and whose `sam_addr` matches the configured endpoint.
+    ///
+    /// Requires a live SAM bridge — set
+    /// `WHISPER_I2P_EXTERNAL_TEST=127.0.0.1:7666` to enable. CI and
+    /// machines without a router skip silently.
+    #[tokio::test]
+    async fn external_pre_start_against_live_sam() {
+        let Ok(endpoint) = std::env::var("WHISPER_I2P_EXTERNAL_TEST") else {
+            eprintln!("skipping: WHISPER_I2P_EXTERNAL_TEST not set");
+            return;
+        };
+        // Sanity: SAM HELLO must work first, else there's no point.
+        if sam_hello_probe(&endpoint).await.is_err() {
+            eprintln!("skipping: no SAM bridge at {endpoint}");
+            return;
+        }
+        let (host, port) = endpoint.rsplit_once(':').unwrap();
+        let port: u16 = port.parse().unwrap();
+
+        let cfg = I2pConfig {
+            profile_dir: tempdir(),
+            enable_transit: false,
+            source: I2pSource::External {
+                host: host.to_string(),
+                port,
+            },
+        };
+
+        let pre = I2PManager::pre_start(cfg)
+            .await
+            .expect("pre_start_external should succeed");
+
+        assert!(
+            pre.child.is_none(),
+            "external mode must not spawn an i2pd subprocess"
+        );
+        assert!(
+            pre.log_path.is_none(),
+            "external mode has no log path of its own"
+        );
+        assert_eq!(pre.sam_addr(), endpoint);
+
+        // shutdown() is a no-op in external mode; should not panic or
+        // try to signal a process we don't own.
+        pre.shutdown().await;
+    }
+
+    /// External mode with an unreachable endpoint should fail fast
+    /// (well under the 15s deadline in practice — TCP RST on loopback
+    /// is immediate). The error message must name the host:port so the
+    /// user knows what to fix.
+    #[tokio::test]
+    async fn external_pre_start_unreachable_fails_with_clear_message() {
+        // Port 1 is reserved and never listens; connect attempts return
+        // ECONNREFUSED immediately.
+        let cfg = I2pConfig {
+            profile_dir: tempdir(),
+            enable_transit: false,
+            source: I2pSource::External {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+            },
+        };
+        let err = I2PManager::pre_start(cfg)
+            .await
+            .expect_err("unreachable external must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("127.0.0.1:1"),
+            "error should name the endpoint, got: {msg}"
+        );
     }
 }

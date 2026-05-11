@@ -6,7 +6,7 @@
 //! up to ~120 s for i2pd's first reseed, `stop()` waits up to ~6 s for
 //! a graceful subprocess exit.
 
-use super::manager::{I2PManager, PreStartedI2pd};
+use super::manager::{I2PManager, I2pSource, PreStartedI2pd};
 use super::queue;
 use super::runtime::{self, I2PRuntime};
 use super::I2pResult;
@@ -15,16 +15,23 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Phase A: spawn i2pd and warm up the network without ever publishing
-/// our destination. Run from app launch so the slow part of cold start
-/// (reseed + tunnel build) overlaps with the user typing their
-/// passphrase. Drop the returned `PreStartedI2pd` if the user closes
-/// the app without unlocking — `kill_on_drop` reaps i2pd.
+/// Phase A: connect (or spawn-then-connect) to the i2pd SAM bridge so
+/// the slow part of cold start overlaps with the user typing their
+/// passphrase. Run from app launch.
+///
+/// In `I2pSource::Bundled` mode, this spawns our subprocess and waits
+/// for SAM. In `I2pSource::External` mode, it skips the spawn and
+/// probes the user-supplied SAM endpoint.
+///
+/// Drop the returned `PreStartedI2pd` if the user closes the app
+/// without unlocking — `kill_on_drop` reaps i2pd in Bundled mode; in
+/// External mode the user's router keeps running on its own.
 pub async fn pre_start(
     profile_dir: PathBuf,
     enable_transit: bool,
+    source: I2pSource,
 ) -> I2pResult<PreStartedI2pd> {
-    let cfg = runtime::config_for(profile_dir, enable_transit);
+    let cfg = runtime::config_for(profile_dir, enable_transit, source);
     I2PManager::pre_start(cfg).await
 }
 
@@ -46,12 +53,13 @@ pub async fn start(
     db: Database,
     profile_dir: PathBuf,
     enable_transit: bool,
+    source: I2pSource,
     dispatcher: super::runtime::FrameDispatcher,
     on_queued_delivered: super::runtime::DeliveredCallback,
 ) -> I2pResult<I2PRuntime> {
     // Back-compat path for callers that have an unlocked DB up front
     // and don't care about the pre-warm split (integration tests).
-    let pre = pre_start(profile_dir.clone(), enable_transit).await?;
+    let pre = pre_start(profile_dir.clone(), enable_transit, source).await?;
     finalize(pre, db, dispatcher, on_queued_delivered).await
 }
 

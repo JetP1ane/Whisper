@@ -187,7 +187,114 @@ connecting"](#app-stuck-on-still-connecting) under troubleshooting.
 
 ---
 
-## Moving to a new device, or recovering from a loss
+## Using your own I2P router (advanced)
+
+By default Whisper spawns its own i2pd subprocess inside the .app bundle.
+That router is SHA-256 pinned (mismatches refuse to start), signed
+alongside the rest of the app with our Apple Developer ID, and runs
+under macOS Hardened Runtime + App Sandbox. For most users, that's the
+right choice and you can ignore this section.
+
+If you already run an I2P router yourself (i2pd via Homebrew, or Java
+I2P) and want Whisper to share its NetDB, tunnels, and reseed state
+instead of running a second router alongside it, you can point Whisper
+at your router's SAM v3 bridge.
+
+### Trust framing, plainly
+
+The bundled router lives inside Whisper's trust boundary: every byte
+is integrity-checked at launch, every dylib it loads is signed under
+the same Developer ID, the subprocess is sandboxed and reaped on
+shutdown.
+
+The external option lives outside that boundary. Whisper can only
+vouch for the SAM messages it sends and receives over the socket you
+configure, and for the end-to-end E2E encryption inside those
+messages. **It cannot vouch for your router's binary, its config, its
+peer selection, its NetDB state, or any other transit-layer
+behavior.** You're substituting your trust assumptions for Whisper's.
+
+That's a fine choice if you're a privacy-conscious user who builds
+their own router or audits their config carefully. It's a poor choice
+if you're just clicking through settings without a reason.
+
+### Setup with Homebrew i2pd
+
+The fastest way to run an external router on macOS is via Homebrew.
+
+```sh
+# 1. Install i2pd
+brew install i2pd
+
+# 2. Enable SAM on the default port. Edit /opt/homebrew/etc/i2pd/i2pd.conf,
+#    find the [sam] section, and uncomment the lines so it reads:
+#
+#      [sam]
+#      enabled = true
+#      address = 127.0.0.1
+#      port = 7656
+#      portudp = 7655
+
+# 3. Start i2pd as a long-running service
+brew services start i2pd
+
+# 4. Verify SAM is up (should return "HELLO REPLY RESULT=OK VERSION=3.3")
+printf 'HELLO VERSION MIN=3.0 MAX=3.3\n' | nc -w 3 127.0.0.1 7656
+```
+
+If `brew services start` doesn't open the port, run i2pd directly
+instead (some macOS launchd plists have quirks):
+
+```sh
+/opt/homebrew/opt/i2pd/bin/i2pd \
+  --datadir=/opt/homebrew/var/lib/i2pd \
+  --conf=/opt/homebrew/etc/i2pd/i2pd.conf \
+  --log=file --logfile=/opt/homebrew/var/log/i2pd/i2pd.log &
+disown
+```
+
+Give i2pd 5-30 seconds on a fresh datadir to reseed and bind SAM.
+
+### Switching Whisper to the external router
+
+1. Open Whisper, unlock your vault.
+2. Open **Settings → Security**.
+3. Find the **I2P router** card.
+4. Check "Use my own I2P router instead of the bundled one."
+5. Fill in **Host** (`127.0.0.1` if your router is on the same Mac) and
+   **Port** (`7656` for the i2pd default).
+6. Click **Test connection**. Expect "✓ Test succeeded."
+7. Click **Save**.
+8. Lock the vault (`⌘L`) and unlock it again — this is what triggers
+   Whisper to drop the bundled router and connect to yours.
+
+To switch back to the bundled router, untick the same checkbox, click
+Save, and lock+unlock.
+
+### What changes when external is active
+
+- The bundled i2pd subprocess does not start at app launch.
+- Your I2P destination key is still stored in Whisper's local
+  SQLCipher vault; only the *transport router* changes, not your
+  identity.
+- Existing contacts and message history are unchanged — only the
+  route between your destination and the I2P mesh is now via the
+  router you operate.
+- The integrity pin in Whisper's startup path is skipped (we can't
+  pin a binary we don't ship). Your router's integrity is your
+  problem.
+- Whisper still runs its own SAM session and master STREAM on top of
+  your router; the protocol surface is identical.
+
+### Remote routers
+
+Whisper accepts any reachable host, not just loopback. You can point
+it at an i2pd running on your LAN, on a Tailscale peer, on a VPS, or
+anywhere else you can connect via TCP. **Doing so means exposing SAM
+to your network**, which is a meaningful security choice — anyone who
+can reach the port can create I2P sessions through your router. Only
+do this when the network path is one you control and the routing
+gain outweighs the exposure.
 
 ### When to use the recovery phrase
 
