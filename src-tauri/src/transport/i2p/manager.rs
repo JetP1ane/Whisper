@@ -285,6 +285,35 @@ fn pick_free_port() -> I2pResult<u16> {
     Ok(port)
 }
 
+/// Enable OS-level TCP keepalive on the master SAM control socket.
+///
+/// Called once in `I2PManager::finalize` after `SESSION CREATE`. The
+/// socket then sits idle for the session's lifetime (SAM v3 reserves
+/// session control sockets for liveness monitoring — no SAM commands
+/// are valid on them post-create). Without keepalive, the underlying
+/// TCP connection eventually gets dropped from NAT state, firewall
+/// idle timers, or macOS App Nap, and i2pd terminates the session
+/// when it notices the socket close.
+///
+/// Tuned aggressively vs macOS defaults: the kernel default for first
+/// probe is 7200s (2 hours), which is useless for chat reliability.
+/// We use 60s before the first probe and 15s between probes, so a
+/// dead connection is detected within roughly 90s instead of hours.
+///
+/// All work happens in the OS network stack — the probe packets are
+/// SAM-protocol-invisible, so this can never trigger i2pd's "command
+/// on session socket" rejection path (the failure mode that the
+/// prior SAM-PING attempt hit).
+fn set_master_keepalive(control: &BufReader<TcpStream>) -> std::io::Result<()> {
+    use socket2::{SockRef, TcpKeepalive};
+    let stream: &TcpStream = control.get_ref();
+    let sock = SockRef::from(stream);
+    let ka = TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    sock.set_tcp_keepalive(&ka)
+}
+
 /// Kill any orphan i2pd subprocess that's still holding a flock on
 /// `<i2p_dir>/i2pd.pid`.
 ///
@@ -766,6 +795,36 @@ impl I2PManager {
         )
         .await?;
         tracing::info!("i2p: master STREAM session `{session_id}` created");
+
+        // OS-level TCP keepalive on the master control socket. The
+        // socket sits idle for the session's lifetime — i2pd holds it
+        // open as the session's lifeline and we never send anything on
+        // it (SAM v3 reserves session control sockets; application
+        // commands like PING are rejected). Without keepalive, NAT
+        // tables, firewall idle timers, or macOS process suspend can
+        // silently drop the underlying TCP state after extended idle.
+        // i2pd then closes the socket from its side and terminates the
+        // session, breaking all inbound and outbound traffic until the
+        // user locks+unlocks the vault.
+        //
+        // TCP keepalive lives entirely in the OS network stack — the
+        // probe packets carry no SAM-level data, so i2pd's protocol
+        // parser never sees them. Failed probes propagate as a socket
+        // error, which manifests as the inbound loop logging warnings
+        // and the next vault lock+unlock cleanly rebuilding the
+        // session.
+        //
+        // Tuned much shorter than macOS defaults (which are 2 hours
+        // before the first probe — useless for chat reliability).
+        if let Err(e) = set_master_keepalive(&control) {
+            // Non-fatal: if keepalive setup fails the session still
+            // works, we just lose the idle-survival property. Log and
+            // continue so a quirky network stack doesn't block unlock.
+            tracing::warn!(
+                "i2p: failed to enable TCP keepalive on master control socket: {e} \
+                 — session will work but may not survive prolonged idle"
+            );
+        }
 
         Ok(Self {
             child,

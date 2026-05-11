@@ -22,6 +22,12 @@ tauri-plugin-notification = "2"
 
 # --- async + serialization ---
 tokio = { version = "1", features = ["full"] }
+# socket2 is already in tokio's transitive tree (via mio); declared here as
+# a direct dep so we can set OS-level TCP keepalive options on the master
+# SAM control socket. Used in `transport::i2p::manager::finalize` so the
+# control socket survives long idle periods without falling off NAT idle
+# timers or macOS process suspend resume.
+socket2 = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
