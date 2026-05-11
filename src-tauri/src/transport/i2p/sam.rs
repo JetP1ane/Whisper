@@ -441,12 +441,25 @@ pub async fn stream_connect(
 /// remote peer dials our destination, the bridge writes a single line
 /// `<peer_b64_destination>\n` and then the raw payload follows.
 ///
-/// Returns `(tcp_stream, peer_destination_b64)`. The caller is then in
-/// raw-bytes mode and should layer their own framing on top.
+/// Returns `(tcp_stream, peer_destination_b64, leftover_bytes)`.
+///
+/// **Leftover bytes** are the part of the peer's first frame that the
+/// `BufReader` pulled into its internal buffer when it read the
+/// destination line. On garlic-routed I2P the destination line and the
+/// start of the first application frame frequently arrive in the same
+/// TCP segment, so `BufReader::read_line` over-reads. The caller MUST
+/// prepend `leftover_bytes` to its frame stream (typically by chaining
+/// a `Cursor` over it before the underlying stream) or the first
+/// inbound frame is silently lost — which manifests as "messages don't
+/// arrive until the app is restarted," because tunnel timing changes
+/// alter the TCP coalescing behavior on the next attempt.
+///
+/// `leftover_bytes` is empty (`Vec::new()`) in the common case where
+/// the peer hadn't started sending payload yet.
 pub async fn stream_accept(
     bridge_addr: &str,
     session_id: &str,
-) -> I2pResult<(TcpStream, String)> {
+) -> I2pResult<(TcpStream, String, Vec<u8>)> {
     if !is_safe_sam_token(session_id) {
         return Err(I2pError::Sam(
             "session id contains unsafe characters — refusing to send to SAM"
@@ -483,21 +496,15 @@ pub async fn stream_accept(
     if peer_dest.is_empty() {
         return Err(I2pError::Sam("empty peer destination on accept".into()));
     }
-    if !buf.buffer().is_empty() {
-        // The peer may have already sent payload by the time we read
-        // the destination line. Drain whatever's buffered so the caller
-        // doesn't lose it. We return that byte slice alongside the
-        // socket via a small framing trick: prepend it onto the inner
-        // TcpStream by way of a `Chain`-style adapter.
-        //
-        // For now, fail loudly — Phase 3 (ConnectionManager) will use a
-        // BufReader-aware accept variant. Worth catching this early.
-        return Err(I2pError::Sam(
-            "peer sent payload before we entered read loop (Phase 3 fix needed)"
-                .into(),
-        ));
-    }
-    Ok((buf.into_inner(), peer_dest))
+    // Snapshot any bytes the BufReader pulled past the destination
+    // line so the caller can replay them ahead of the TcpStream. See
+    // the docstring above for why this matters.
+    let leftover: Vec<u8> = if buf.buffer().is_empty() {
+        Vec::new()
+    } else {
+        buf.buffer().to_vec()
+    };
+    Ok((buf.into_inner(), peer_dest, leftover))
 }
 
 /// `NAMING LOOKUP` — resolve a short name (e.g. `whisper.alice.i2p`) to a

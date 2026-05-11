@@ -294,10 +294,10 @@ async fn inbound_loop(
             }
             res = sam::stream_accept(&sam_addr, &session_id) => {
                 match res {
-                    Ok((stream, peer_dest)) => {
+                    Ok((stream, peer_dest, leftover)) => {
                         let h = handler.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_inbound_stream(stream, peer_dest, h).await {
+                            if let Err(e) = handle_inbound_stream(stream, peer_dest, leftover, h).await {
                                 tracing::warn!("i2p: inbound stream errored: {e}");
                             }
                         });
@@ -317,20 +317,34 @@ async fn inbound_loop(
 }
 
 async fn handle_inbound_stream(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer_dest: String,
+    leftover: Vec<u8>,
     handler: InboundHandler,
 ) -> I2pResult<()> {
+    // Split into owned read/write halves so we can chain the leftover
+    // bytes onto the read side without losing the write side. SAM
+    // frequently sends the peer's destination line and the first bytes
+    // of the peer's payload in the same TCP segment, in which case
+    // `stream_accept` returns those payload bytes in `leftover`. We
+    // replay them ahead of the TcpStream so `read_frame` sees the
+    // complete first frame — without this, the first inbound message
+    // after the connection opens is silently lost.
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = tokio::io::AsyncReadExt::chain(
+        std::io::Cursor::new(leftover),
+        read_half,
+    );
     loop {
-        let frame = match read_frame(&mut stream).await {
+        let frame = match read_frame(&mut reader).await {
             Ok(f) => f,
             Err(I2pError::Disconnected) => return Ok(()),
             Err(e) => return Err(e),
         };
         match frame.kind {
             FrameType::KeepalivePing => {
-                write_frame(&mut stream, &Frame::pong()).await?;
-                stream.flush().await?;
+                write_frame(&mut write_half, &Frame::pong()).await?;
+                write_half.flush().await?;
             }
             FrameType::KeepalivePong => {
                 // No-op; we don't currently track outbound pings.
@@ -354,8 +368,8 @@ async fn handle_inbound_stream(
                 // visible at the UI layer immediately.
                 match handler(peer_dest.clone(), frame).await {
                     Ok(()) => {
-                        write_frame(&mut stream, &Frame::ack(hash_arr)).await?;
-                        stream.flush().await?;
+                        write_frame(&mut write_half, &Frame::ack(hash_arr)).await?;
+                        write_half.flush().await?;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -365,7 +379,7 @@ async fn handle_inbound_stream(
                         );
                         // Drop the connection so the sender sees an
                         // explicit failure rather than a hang.
-                        let _ = stream.shutdown().await;
+                        let _ = write_half.shutdown().await;
                         return Ok(());
                     }
                 }
