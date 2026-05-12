@@ -25,7 +25,7 @@ cask "noctis-whisper" do
 
   # Apple Silicon-only for now — Intel build to follow.
   depends_on arch: :arm64
-  sha256 "76bd010bb7ba56b86ec195411beed392cc4071edbe26f2f05e1a983b08122bcd"
+  sha256 "2b116be067558926d0bfceaf857ea04f9b5b1de4ed324e2058633b5b426f4f25"
   url "https://github.com/JetP1ane/Whisper/releases/download/v#{version}/Whisper_#{version}_aarch64.dmg"
 
   name "Whisper"

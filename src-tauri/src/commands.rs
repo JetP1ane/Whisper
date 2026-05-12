@@ -785,8 +785,21 @@ fn spawn_i2p_start(
                 None
             };
 
+            // Source-mismatch check: the pre-warm captured at app
+            // launch is bound to whatever `i2p_source` was persisted
+            // at that moment. If the user opened Settings → Security
+            // and switched modes while the vault was still locked,
+            // the persisted preference now differs from what the
+            // pre-warm is running against. Using the stale pre-warm
+            // in that case would silently connect to the wrong router
+            // (or the bundled one when the user wanted external,
+            // wasting their explicit configuration). Detect the
+            // mismatch and discard the pre-warm in favor of a fresh
+            // cold start that honors the current preference.
+            let current_source =
+                crate::transport::i2p::runtime::read_persisted_source(&profile_dir);
             let result = match prewarmed {
-                Some(pre) => {
+                Some(pre) if pre.source() == &current_source => {
                     tracing::info!(
                         "i2p: using pre-warmed i2pd (sam={}); finalizing transport",
                         pre.sam_addr()
@@ -799,20 +812,39 @@ fn spawn_i2p_start(
                     )
                     .await
                 }
-                None => {
-                    let source = crate::transport::i2p::runtime::read_persisted_source(
-                        &profile_dir,
+                Some(pre) => {
+                    tracing::info!(
+                        "i2p: pre-warm source ({:?}) no longer matches user preference \
+                         ({:?}) — discarding pre-warm and cold-starting fresh",
+                        pre.source(),
+                        current_source
                     );
+                    pre.shutdown().await;
+                    crate::transport::i2p::lifecycle::start(
+                        db,
+                        profile_dir.clone(),
+                        enable_transit,
+                        current_source,
+                        dispatcher,
+                        on_queued_delivered,
+                    )
+                    .await
+                }
+                None => {
                     tracing::info!(
                         "i2p: no pre-warm available — running full cold start \
                          (attempt={attempt}, source={})",
-                        if source.is_bundled() { "bundled" } else { "external" }
+                        if current_source.is_bundled() {
+                            "bundled"
+                        } else {
+                            "external"
+                        }
                     );
                     crate::transport::i2p::lifecycle::start(
                         db,
                         profile_dir.clone(),
                         enable_transit,
-                        source,
+                        current_source,
                         dispatcher,
                         on_queued_delivered,
                     )
