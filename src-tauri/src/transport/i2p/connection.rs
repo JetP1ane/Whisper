@@ -44,8 +44,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
+
+/// Maximum number of concurrent inbound streams. Prevents a malicious
+/// peer (or coordinated attack) from exhausting memory by opening
+/// thousands of simultaneous connections. Each held permit represents
+/// one active inbound stream; new connections block until a slot frees
+/// up or the accept times out.
+const MAX_CONCURRENT_INBOUND: usize = 100;
+
+/// Idle timeout for a single inbound stream. A peer that holds a
+/// connection open but sends no data (slow-read attack) is dropped
+/// after this duration, freeing the slot for legitimate traffic.
+const INBOUND_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Inbound handler signature. The closure receives the remote peer's
 /// full base64 destination + the decoded frame, and returns a result.
@@ -252,8 +264,9 @@ impl ConnectionManager {
         let sam_addr = self.sam_addr.clone();
         let session_id = self.session_id.clone();
         let shutdown = self.inbound_shutdown.clone();
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND));
         let task = tokio::spawn(async move {
-            inbound_loop(sam_addr, session_id, handler, shutdown).await;
+            inbound_loop(sam_addr, session_id, handler, shutdown, semaphore).await;
         });
         *guard = Some(task);
         Ok(())
@@ -285,6 +298,7 @@ async fn inbound_loop(
     session_id: String,
     handler: InboundHandler,
     shutdown: Arc<tokio::sync::Notify>,
+    semaphore: Arc<Semaphore>,
 ) {
     loop {
         tokio::select! {
@@ -295,8 +309,30 @@ async fn inbound_loop(
             res = sam::stream_accept(&sam_addr, &session_id) => {
                 match res {
                     Ok((stream, peer_dest, leftover)) => {
+                        // H-1: bound concurrent inbound streams. If all
+                        // permits are taken, wait up to the idle timeout
+                        // for a slot; if none frees, drop the connection
+                        // rather than letting it queue indefinitely behind
+                        // the semaphore (which would hold a SAM socket
+                        // open and starve the peer).
+                        let permit = match tokio::time::timeout(
+                            INBOUND_STREAM_IDLE_TIMEOUT,
+                            semaphore.clone().acquire_owned(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(p)) => p,
+                            Ok(Err(_)) => return, // semaphore closed — shutting down
+                            Err(_) => {
+                                tracing::debug!(
+                                    "i2p: inbound semaphore saturated, dropping queued connection"
+                                );
+                                return;
+                            }
+                        };
                         let h = handler.clone();
                         tokio::spawn(async move {
+                            let _permit = permit; // held until task completes or aborts
                             if let Err(e) = handle_inbound_stream(stream, peer_dest, leftover, h).await {
                                 tracing::warn!("i2p: inbound stream errored: {e}");
                             }
@@ -336,10 +372,26 @@ async fn handle_inbound_stream(
         read_half,
     );
     loop {
-        let frame = match read_frame(&mut reader).await {
-            Ok(f) => f,
-            Err(I2pError::Disconnected) => return Ok(()),
-            Err(e) => return Err(e),
+        // H-2: wrap each read in a timeout so a slow-read attack
+        // (peer sends one byte per minute) cannot hold this task —
+        // and its semaphore permit — hostage indefinitely.
+        let frame = match tokio::time::timeout(
+            INBOUND_STREAM_IDLE_TIMEOUT,
+            read_frame(&mut reader),
+        )
+        .await
+        {
+            Ok(Ok(f)) => f,
+            Ok(Err(I2pError::Disconnected)) => return Ok(()),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                tracing::debug!(
+                    "i2p: inbound stream idle timeout ({INBOUND_STREAM_IDLE_TIMEOUT:?}), \
+                     dropping {}",
+                    &peer_dest[..16.min(peer_dest.len())]
+                );
+                return Ok(());
+            }
         };
         match frame.kind {
             FrameType::KeepalivePing => {
